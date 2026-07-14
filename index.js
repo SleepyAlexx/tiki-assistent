@@ -25,6 +25,7 @@ const {
   UserSelectMenuBuilder,
   StringSelectMenuBuilder,
   ThreadAutoArchiveDuration,
+  ChannelType,
 } = require("discord.js");
 
 const { Pool } = require("pg");
@@ -238,11 +239,6 @@ async function withTransaction(callback) {
 const managementDrafts = new Map();
 const dutyCorrectionDrafts = new Map();
 const timeManagementDrafts = new Map();
-
-const leaderboardPages = {
-  weekly: 0,
-  total: 0,
-};
 
 // Verhindert, dass automatische Rollensynchronisierung während
 // einer Kündigung oder eines Teamupdates Rollen wieder hinzufügt.
@@ -875,6 +871,42 @@ async function registerCommands() {
       .setDescription("Aktualisiert das Tiki-Bar-Dashboard."),
 
     new SlashCommandBuilder()
+      .setName("wochenzeiten")
+      .setDescription(
+        "Sendet die Wochenzeiten-Übersicht in einen gewünschten Kanal."
+      )
+      .addChannelOption((option) =>
+        option
+          .setName("kanal")
+          .setDescription(
+            "Zielkanal – ohne Auswahl wird der aktuelle Kanal verwendet"
+          )
+          .addChannelTypes(
+            ChannelType.GuildText,
+            ChannelType.GuildAnnouncement
+          )
+          .setRequired(false)
+      ),
+
+    new SlashCommandBuilder()
+      .setName("gesamtzeiten")
+      .setDescription(
+        "Sendet die Gesamtzeiten-Übersicht in einen gewünschten Kanal."
+      )
+      .addChannelOption((option) =>
+        option
+          .setName("kanal")
+          .setDescription(
+            "Zielkanal – ohne Auswahl wird der aktuelle Kanal verwendet"
+          )
+          .addChannelTypes(
+            ChannelType.GuildText,
+            ChannelType.GuildAnnouncement
+          )
+          .setRequired(false)
+      ),
+
+    new SlashCommandBuilder()
       .setName("akte")
       .setDescription("Sendet die Personalakte eines Mitarbeiters.")
       .addUserOption((option) =>
@@ -1351,13 +1383,13 @@ function getRankSymbol(rank) {
 function buildLeaderboardButtons(type, page, pageCount) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`leaderboard_${type}_prev`)
+      .setCustomId(`leaderboard:${type}:prev:${page}`)
       .setEmoji("⬅️")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(page <= 0),
 
     new ButtonBuilder()
-      .setCustomId(`leaderboard_${type}_next`)
+      .setCustomId(`leaderboard:${type}:next:${page}`)
       .setEmoji("➡️")
       .setStyle(ButtonStyle.Primary)
       .setDisabled(page >= pageCount - 1)
@@ -1392,8 +1424,6 @@ async function buildLeaderboardPayload(type, requestedPage = 0) {
     Math.max(0, Number(requestedPage) || 0),
     pageCount - 1
   );
-
-  leaderboardPages[type] = page;
 
   const startIndex = page * pageSize;
   const pageRows = sortedRows.slice(
@@ -1449,22 +1479,18 @@ async function buildLeaderboardPayload(type, requestedPage = 0) {
   };
 }
 
-async function updateLeaderboardMessage(type) {
-  const settingKey =
-    type === "weekly"
-      ? "weekly_leaderboard_message_id"
-      : "total_leaderboard_message_id";
+async function sendLeaderboardToChannel(type, channel) {
+  if (
+    !channel?.isTextBased?.() ||
+    typeof channel.send !== "function"
+  ) {
+    throw new Error(
+      "Der ausgewählte Kanal unterstützt keine Nachrichten."
+    );
+  }
 
-  const result = await buildLeaderboardPayload(
-    type,
-    leaderboardPages[type]
-  );
-
-  return sendOrUpdatePermanentMessage(
-    CHANNELS.dashboard,
-    settingKey,
-    result.payload
-  );
+  const result = await buildLeaderboardPayload(type, 0);
+  return channel.send(result.payload);
 }
 
 async function buildDashboardEmbed() {
@@ -1650,9 +1676,10 @@ async function updateDashboardMessage() {
 }
 
 async function updateDashboardOverview() {
+  // Das feste Dashboard bleibt im konfigurierten Dashboard-Kanal.
+  // Wochen- und Gesamtzeiten werden bewusst nur noch per Slash-Command
+  // in den jeweils gewünschten Kanal gesendet.
   await updateDashboardMessage();
-  await updateLeaderboardMessage("weekly");
-  await updateLeaderboardMessage("total");
 }
 
 // ============================================================
@@ -4056,6 +4083,8 @@ async function handleChatInputCommand(interaction) {
           "└ Abmeldung, Einkauf, Bewerbung und Hausverbot\n\n" +
           "🛠️ `/managementpanel`\n" +
           "└ Verwarnungen, Teamupdates, Kündigungen, Einweisungen und Zeitverwaltung\n\n" +
+          "📊 `/wochenzeiten` und `/gesamtzeiten`\n" +
+          "└ Zeitübersichten im aktuellen oder ausgewählten Kanal senden\n\n" +
           "🔧 `/dienst-korrektur`\n" +
           "└ Aktiven Dienst nach Crash korrekt abschließen\n\n" +
           "📁 `/akte`, `/personalnotiz`, `/mitarbeitercheck`\n" +
@@ -4074,6 +4103,8 @@ async function handleChatInputCommand(interaction) {
     "managementpanel",
     "registrierungspanel",
     "dashboard",
+    "wochenzeiten",
+    "gesamtzeiten",
     "akte",
     "personalnotiz",
     "mitarbeitercheck",
@@ -4125,8 +4156,46 @@ async function handleChatInputCommand(interaction) {
     await updateDashboardOverview();
 
     return interaction.editReply(
-      `✅ Dashboard, Wochenzeiten und Gesamtzeiten wurden in ` +
-      `<#${CHANNELS.dashboard}> aktualisiert.`
+      `✅ Das Dashboard wurde in <#${CHANNELS.dashboard}> aktualisiert.`
+    );
+  }
+
+  if (
+    interaction.commandName === "wochenzeiten" ||
+    interaction.commandName === "gesamtzeiten"
+  ) {
+    const selectedChannel =
+      interaction.options.getChannel("kanal");
+    const targetChannel =
+      selectedChannel || interaction.channel;
+
+    if (
+      !targetChannel?.isTextBased?.() ||
+      typeof targetChannel.send !== "function"
+    ) {
+      return interaction.reply({
+        content:
+          "❌ Bitte wähle einen normalen Textkanal aus.",
+        ephemeral: true,
+      });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const type =
+      interaction.commandName === "wochenzeiten"
+        ? "weekly"
+        : "total";
+
+    await sendLeaderboardToChannel(type, targetChannel);
+
+    const label =
+      type === "weekly"
+        ? "Wochenzeiten"
+        : "Gesamtzeiten";
+
+    return interaction.editReply(
+      `✅ Die ${label}-Übersicht wurde in ${targetChannel} gesendet.`
     );
   }
 
@@ -4255,14 +4324,21 @@ async function handleChatInputCommand(interaction) {
 async function handleButton(interaction) {
   const customId = interaction.customId;
 
-  if (
-    customId === "leaderboard_weekly_prev" ||
-    customId === "leaderboard_weekly_next" ||
-    customId === "leaderboard_total_prev" ||
-    customId === "leaderboard_total_next"
-  ) {
-    const [, type, direction] = customId.split("_");
-    const currentPage = leaderboardPages[type] || 0;
+  if (customId.startsWith("leaderboard:")) {
+    const [, type, direction, pageRaw] =
+      customId.split(":");
+
+    if (
+      !["weekly", "total"].includes(type) ||
+      !["prev", "next"].includes(direction)
+    ) {
+      return interaction.reply({
+        content: "❌ Diese Zeitübersicht ist ungültig.",
+        ephemeral: true,
+      });
+    }
+
+    const currentPage = Number(pageRaw) || 0;
     const requestedPage =
       direction === "next"
         ? currentPage + 1
@@ -5426,7 +5502,7 @@ client.once(Events.ClientReady, async (readyClient) => {
 
     await updateDashboardOverview().catch((error) => {
       console.warn(
-        "⚠️ Dashboard-Übersichten konnten beim Start nicht aktualisiert werden:",
+        "⚠️ Dashboard konnte beim Start nicht aktualisiert werden:",
         error.message
       );
     });
@@ -5434,7 +5510,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     setInterval(() => {
       updateDashboardOverview().catch((error) =>
         console.error(
-          "❌ Dashboard-Übersichtsfehler:",
+          "❌ Dashboard-Aktualisierungsfehler:",
           error
         )
       );
