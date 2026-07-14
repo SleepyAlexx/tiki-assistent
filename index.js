@@ -181,6 +181,7 @@ const SETTINGS = Object.freeze({
   timezone: "Europe/Berlin",
   statusIntervalMs: 5_000,
   dashboardIntervalMs: 2 * 60 * 1000,
+  leaderboardPageSize: 7,
   staleDutyCheckIntervalMs: 10 * 60 * 1000,
   staleDutyAfterMs: 6 * 60 * 60 * 1000,
 });
@@ -237,6 +238,11 @@ async function withTransaction(callback) {
 const managementDrafts = new Map();
 const dutyCorrectionDrafts = new Map();
 const timeManagementDrafts = new Map();
+
+const leaderboardPages = {
+  weekly: 0,
+  total: 0,
+};
 
 // Verhindert, dass automatische Rollensynchronisierung während
 // einer Kündigung oder eines Teamupdates Rollen wieder hinzufügt.
@@ -1234,12 +1240,17 @@ async function postManagementPanel() {
 }
 
 // ============================================================
-// DASHBOARD
+// DASHBOARD UND ZEITÜBERSICHTEN
 // ============================================================
 
 async function getTrackedDashboardMembers() {
   const guild = await client.guilds.fetch(GUILD_ID);
-  await guild.members.fetch();
+
+  // Die Mitglieder wurden beim Start bereits synchronisiert.
+  // Nur wenn der Cache praktisch leer ist, wird erneut geladen.
+  if (guild.members.cache.size <= 1) {
+    await guild.members.fetch();
+  }
 
   const trackedMembers = guild.members.cache.filter(
     (member) =>
@@ -1251,21 +1262,216 @@ async function getTrackedDashboardMembers() {
   return {
     guild,
     trackedMembers,
-    trackedUserIds: trackedMembers.map((member) => member.id),
+    trackedUserIds: [...trackedMembers.keys()],
   };
 }
 
-async function buildDashboardEmbed() {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  await guild.members.fetch();
+async function getDashboardTimeSnapshot() {
+  const {
+    trackedMembers,
+    trackedUserIds,
+  } = await getTrackedDashboardMembers();
 
-  // Für sämtliche Dashboard-Zahlen und Ranglisten zählen ausschließlich
-  // Mitglieder mit Mitarbeiter- oder Probe-Mitarbeiterrolle.
-  const employeeMembers = guild.members.cache.filter(
-    (member) => !member.user.bot && isEmployee(member)
+  if (trackedUserIds.length === 0) {
+    return {
+      trackedMembers,
+      trackedUserIds,
+      rows: [],
+      activeUserIds: new Set(),
+    };
+  }
+
+  const [timeResult, activeResult] = await Promise.all([
+    query(
+      `
+        SELECT user_id, weekly_minutes, total_minutes
+        FROM employees
+        WHERE user_id = ANY($1::text[])
+      `,
+      [trackedUserIds]
+    ),
+    query(
+      `
+        SELECT user_id
+        FROM active_sessions
+        WHERE user_id = ANY($1::text[])
+      `,
+      [trackedUserIds]
+    ),
+  ]);
+
+  const timeByUser = new Map(
+    timeResult.rows.map((row) => [
+      row.user_id,
+      {
+        weeklyMinutes: Number(row.weekly_minutes) || 0,
+        totalMinutes: Number(row.total_minutes) || 0,
+      },
+    ])
   );
 
-  const employeeIds = [...employeeMembers.keys()];
+  const activeUserIds = new Set(
+    activeResult.rows.map((row) => row.user_id)
+  );
+
+  const rows = trackedUserIds.map((userId) => ({
+    userId,
+    weeklyMinutes:
+      timeByUser.get(userId)?.weeklyMinutes || 0,
+    totalMinutes:
+      timeByUser.get(userId)?.totalMinutes || 0,
+  }));
+
+  return {
+    trackedMembers,
+    trackedUserIds,
+    rows,
+    activeUserIds,
+  };
+}
+
+function formatLeaderboardMinutes(minutes) {
+  const safe = Math.max(0, Math.round(Number(minutes) || 0));
+  const hours = Math.floor(safe / 60);
+  const rest = safe % 60;
+
+  const hourText = hours === 1 ? "Stunde" : "Stunden";
+  const minuteText = rest === 1 ? "Minute" : "Minuten";
+
+  return `${hours} ${hourText} & ${rest} ${minuteText}`;
+}
+
+function getRankSymbol(rank) {
+  if (rank === 1) return "🥇";
+  if (rank === 2) return "🥈";
+  if (rank === 3) return "🥉";
+  return `**${rank}.**`;
+}
+
+function buildLeaderboardButtons(type, page, pageCount) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`leaderboard_${type}_prev`)
+      .setEmoji("⬅️")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 0),
+
+    new ButtonBuilder()
+      .setCustomId(`leaderboard_${type}_next`)
+      .setEmoji("➡️")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(page >= pageCount - 1)
+  );
+}
+
+async function buildLeaderboardPayload(type, requestedPage = 0) {
+  const snapshot = await getDashboardTimeSnapshot();
+
+  const isWeekly = type === "weekly";
+  const minuteKey = isWeekly
+    ? "weeklyMinutes"
+    : "totalMinutes";
+
+  const sortedRows = [...snapshot.rows].sort((a, b) => {
+    const difference = b[minuteKey] - a[minuteKey];
+
+    if (difference !== 0) {
+      return difference;
+    }
+
+    return a.userId.localeCompare(b.userId);
+  });
+
+  const pageSize = SETTINGS.leaderboardPageSize;
+  const pageCount = Math.max(
+    1,
+    Math.ceil(sortedRows.length / pageSize)
+  );
+
+  const page = Math.min(
+    Math.max(0, Number(requestedPage) || 0),
+    pageCount - 1
+  );
+
+  leaderboardPages[type] = page;
+
+  const startIndex = page * pageSize;
+  const pageRows = sortedRows.slice(
+    startIndex,
+    startIndex + pageSize
+  );
+
+  const description = pageRows.length
+    ? pageRows
+        .map((row, index) => {
+          const rank = startIndex + index + 1;
+          const activeMarker =
+            snapshot.activeUserIds.has(row.userId)
+              ? " 🟢"
+              : "";
+
+          return (
+            `${getRankSymbol(rank)}${activeMarker} <@${row.userId}>\n` +
+            `└ ⏱️ **${formatLeaderboardMinutes(
+              row[minuteKey]
+            )}**`
+          );
+        })
+        .join("\n\n")
+    : "Noch keine Mitarbeiterzeiten vorhanden.";
+
+  const title = isWeekly
+    ? "🍸 • TIKI BAR • WOCHENZEITEN"
+    : "🍸 • TIKI BAR • GESAMTZEITEN";
+
+  const color = isWeekly ? 0x57f287 : 0x3498db;
+
+  const embed = new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setDescription(description)
+    .setFooter({
+      text:
+        `Tiki Bar • Live alle 2 Minuten • ` +
+        `Seite ${page + 1}/${pageCount}`,
+    })
+    .setTimestamp();
+
+  return {
+    page,
+    pageCount,
+    payload: {
+      embeds: [embed],
+      components: [
+        buildLeaderboardButtons(type, page, pageCount),
+      ],
+    },
+  };
+}
+
+async function updateLeaderboardMessage(type) {
+  const settingKey =
+    type === "weekly"
+      ? "weekly_leaderboard_message_id"
+      : "total_leaderboard_message_id";
+
+  const result = await buildLeaderboardPayload(
+    type,
+    leaderboardPages[type]
+  );
+
+  return sendOrUpdatePermanentMessage(
+    CHANNELS.dashboard,
+    settingKey,
+    result.payload
+  );
+}
+
+async function buildDashboardEmbed() {
+  const {
+    trackedMembers: employeeMembers,
+    trackedUserIds: employeeIds,
+  } = await getTrackedDashboardMembers();
 
   const [
     activeSessions,
@@ -1325,72 +1531,41 @@ async function buildDashboardEmbed() {
     ])
   );
 
-  const rankedWeekly = employeeIds
-    .map((userId) => ({
-      userId,
-      minutes: timeByUser.get(userId)?.weekly || 0,
-    }))
-    .sort((a, b) => b.minutes - a.minutes)
-    .slice(0, 5);
-
-  const rankedTotal = employeeIds
-    .map((userId) => ({
-      userId,
-      minutes: timeByUser.get(userId)?.total || 0,
-    }))
-    .sort((a, b) => b.minutes - a.minutes)
-    .slice(0, 5);
-
   const totalWeeklyMinutes = employeeIds.reduce(
-    (sum, userId) => sum + (timeByUser.get(userId)?.weekly || 0),
+    (sum, userId) =>
+      sum + (timeByUser.get(userId)?.weekly || 0),
     0
   );
 
   const averageWeeklyMinutes =
     employeeIds.length > 0
-      ? Math.round(totalWeeklyMinutes / employeeIds.length)
+      ? Math.round(
+          totalWeeklyMinutes / employeeIds.length
+        )
       : 0;
 
-  const activeEmployeeSessions = activeSessions.rows.filter((row) =>
-    employeeMembers.has(row.user_id)
-  );
+  const activeEmployeeSessions =
+    activeSessions.rows.filter((row) =>
+      employeeMembers.has(row.user_id)
+    );
 
   const activeList = activeEmployeeSessions.length
     ? activeEmployeeSessions
         .map(
           (row) =>
-            `└ <@${row.user_id}> • seit ${formatDateTime(row.started_at)}`
+            `└ <@${row.user_id}> • seit ` +
+            `${formatDateTime(row.started_at)}`
         )
         .join("\n")
     : "└ Niemand ist aktuell eingestempelt.";
-
-  const weeklyList = rankedWeekly.length
-    ? rankedWeekly
-        .map(
-          (row, index) =>
-            `└ **${index + 1}.** <@${row.userId}> • ${formatShortMinutes(
-              row.minutes
-            )}`
-        )
-        .join("\n")
-    : "└ Noch keine Mitarbeiterzeiten vorhanden.";
-
-  const totalList = rankedTotal.length
-    ? rankedTotal
-        .map(
-          (row, index) =>
-            `└ **${index + 1}.** <@${row.userId}> • ${formatShortMinutes(
-              row.minutes
-            )}`
-        )
-        .join("\n")
-    : "└ Noch keine Mitarbeiterzeiten vorhanden.";
 
   const activeWarningCount =
     Number(warningSummary.rows[0]?.active_count) || 0;
 
   const oldWarningCount =
-    Number(warningSummary.rows[0]?.older_than_14_days) || 0;
+    Number(
+      warningSummary.rows[0]?.older_than_14_days
+    ) || 0;
 
   const absenceCount =
     Number(absenceSummary.rows[0]?.count) || 0;
@@ -1399,18 +1574,22 @@ async function buildDashboardEmbed() {
 
   if (oldWarningCount > 0) {
     openTasks.push(
-      `└ 🔴 Verwarnungen über 14 Tage prüfen: **${oldWarningCount}**`
+      `└ 🔴 Verwarnungen über 14 Tage prüfen: ` +
+      `**${oldWarningCount}**`
     );
   }
 
   if (absenceCount > 0) {
     openTasks.push(
-      `└ 🟡 Aktuelle/kommende Abmeldungen prüfen: **${absenceCount}**`
+      `└ 🟡 Aktuelle/kommende Abmeldungen prüfen: ` +
+      `**${absenceCount}**`
     );
   }
 
   if (openTasks.length === 0) {
-    openTasks.push("└ 🟢 Zurzeit sind keine offenen Prüfaufgaben vorhanden.");
+    openTasks.push(
+      "└ 🟢 Zurzeit sind keine offenen Prüfaufgaben vorhanden."
+    );
   }
 
   return createBaseEmbed()
@@ -1429,7 +1608,9 @@ async function buildDashboardEmbed() {
         `└ **${activeEmployeeSessions.length}**\n\n` +
 
         "📊 **Ø Wochenzeit pro Mitarbeiter**\n" +
-        `└ **${formatShortMinutes(averageWeeklyMinutes)}**\n\n` +
+        `└ **${formatShortMinutes(
+          averageWeeklyMinutes
+        )}**\n\n` +
 
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
 
@@ -1445,14 +1626,6 @@ async function buildDashboardEmbed() {
 
         "📌 **OFFENE AUFGABEN**\n" +
         `${openTasks.join("\n")}\n\n` +
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
-
-        "📈 **WOCHENZEIT – TOP 5**\n" +
-        `${weeklyList}\n\n` +
-
-        "🏆 **GESAMTZEIT – TOP 5**\n" +
-        `${totalList}\n\n` +
 
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
 
@@ -1476,7 +1649,11 @@ async function updateDashboardMessage() {
   );
 }
 
-
+async function updateDashboardOverview() {
+  await updateDashboardMessage();
+  await updateLeaderboardMessage("weekly");
+  await updateLeaderboardMessage("total");
+}
 
 // ============================================================
 // PERSONALAKTEN
@@ -3945,10 +4122,11 @@ async function handleChatInputCommand(interaction) {
 
   if (interaction.commandName === "dashboard") {
     await interaction.deferReply({ ephemeral: true });
-    await updateDashboardMessage();
+    await updateDashboardOverview();
 
     return interaction.editReply(
-      `✅ Das Dashboard wurde in <#${CHANNELS.dashboard}> aktualisiert.`
+      `✅ Dashboard, Wochenzeiten und Gesamtzeiten wurden in ` +
+      `<#${CHANNELS.dashboard}> aktualisiert.`
     );
   }
 
@@ -4076,6 +4254,27 @@ async function handleChatInputCommand(interaction) {
 
 async function handleButton(interaction) {
   const customId = interaction.customId;
+
+  if (
+    customId === "leaderboard_weekly_prev" ||
+    customId === "leaderboard_weekly_next" ||
+    customId === "leaderboard_total_prev" ||
+    customId === "leaderboard_total_next"
+  ) {
+    const [, type, direction] = customId.split("_");
+    const currentPage = leaderboardPages[type] || 0;
+    const requestedPage =
+      direction === "next"
+        ? currentPage + 1
+        : currentPage - 1;
+
+    const result = await buildLeaderboardPayload(
+      type,
+      requestedPage
+    );
+
+    return interaction.update(result.payload);
+  }
 
   if (customId === "open_registration_modal") {
     return interaction.showModal(registrationModal());
@@ -5225,16 +5424,19 @@ client.once(Events.ClientReady, async (readyClient) => {
     updateBotStatus();
     setInterval(updateBotStatus, SETTINGS.statusIntervalMs);
 
-    await updateDashboardMessage().catch((error) => {
+    await updateDashboardOverview().catch((error) => {
       console.warn(
-        "⚠️ Dashboard konnte beim Start nicht aktualisiert werden:",
+        "⚠️ Dashboard-Übersichten konnten beim Start nicht aktualisiert werden:",
         error.message
       );
     });
 
     setInterval(() => {
-      updateDashboardMessage().catch((error) =>
-        console.error("❌ Dashboard-Intervallfehler:", error)
+      updateDashboardOverview().catch((error) =>
+        console.error(
+          "❌ Dashboard-Übersichtsfehler:",
+          error
+        )
       );
     }, SETTINGS.dashboardIntervalMs);
 
