@@ -24,6 +24,7 @@ const {
   SlashCommandBuilder,
   UserSelectMenuBuilder,
   StringSelectMenuBuilder,
+  ThreadAutoArchiveDuration,
 } = require("discord.js");
 
 const { Pool } = require("pg");
@@ -69,13 +70,21 @@ const ROLES = Object.freeze({
   deputyOwner: "1526427753740767356",
   fullAccess: "1526427753740767355",
 
+  // Management-Hierarchie
+  probationManager: "1526427753707081754",
   management: [
-    "1526427753707081755",
-    "1526427753707081756",
+    "1526427753707081755", // Manager
+    "1526427753707081756", // Personal Manager
   ],
+
+  // Automatisch mitzugebende Verwaltungsrolle
+  managementAccess: "1526427753740767357",
 
   employee: "1526427753707081750",
   probationEmployee: "1526427753707081749",
+
+  // Automatisch mit Mitarbeiter oder Probe-Mitarbeiter mitzugeben
+  employeeAddon: "1526427753707081752",
 
   citizen: [
     "1526427753690431639",
@@ -93,24 +102,39 @@ const ROLES = Object.freeze({
   onDuty: "1526427753740767359",
 });
 
+const MANAGER_POSITION_ROLE_IDS = [
+  ROLES.probationManager,
+  ...ROLES.management,
+];
+
 const MANAGEMENT_ROLE_IDS = [
   ROLES.owner,
   ROLES.deputyOwner,
   ROLES.fullAccess,
-  ...ROLES.management,
+  ...MANAGER_POSITION_ROLE_IDS,
 ];
 
-const TEAM_ROLE_IDS = [
-  ROLES.owner,
-  ROLES.deputyOwner,
-  ROLES.fullAccess,
-  ...ROLES.management,
+// Nur diese beiden Rollen zählen im Dashboard als Mitarbeiter.
+// Inhaber, Management und Vollzugriff werden nur dann mitgezählt,
+// wenn sie zusätzlich eine dieser Mitarbeiterrollen besitzen.
+const EMPLOYEE_ROLE_IDS = [
   ROLES.employee,
   ROLES.probationEmployee,
 ];
 
+const TEAM_ROLE_IDS = [
+  ...MANAGEMENT_ROLE_IDS,
+  ...EMPLOYEE_ROLE_IDS,
+];
+
+// Bei einer Kündigung werden alle Team-, Zusatz-, Verwaltungs-,
+// Verwarnungs- und Dienstrrollen entfernt.
 const TERMINATION_REMOVE_ROLE_IDS = [
-  ...ROLES.management,
+  ROLES.managementAccess,
+  ROLES.management[1],
+  ROLES.management[0],
+  ROLES.probationManager,
+  ROLES.employeeAddon,
   ROLES.employee,
   ROLES.probationEmployee,
   ROLES.warning1,
@@ -214,6 +238,25 @@ const managementDrafts = new Map();
 const dutyCorrectionDrafts = new Map();
 const timeManagementDrafts = new Map();
 
+// Verhindert, dass automatische Rollensynchronisierung während
+// einer Kündigung oder eines Teamupdates Rollen wieder hinzufügt.
+const roleSyncSuppressedUntil = new Map();
+
+function suppressRoleSync(userId, durationMs = 8_000) {
+  roleSyncSuppressedUntil.set(userId, Date.now() + durationMs);
+}
+
+function isRoleSyncSuppressed(userId) {
+  const until = roleSyncSuppressedUntil.get(userId) || 0;
+
+  if (until <= Date.now()) {
+    roleSyncSuppressedUntil.delete(userId);
+    return false;
+  }
+
+  return true;
+}
+
 function draftKey(userId, type) {
   return `${userId}:${type}`;
 }
@@ -232,7 +275,15 @@ function canManage(member) {
 }
 
 function isEmployee(member) {
-  return hasAnyRole(member, TEAM_ROLE_IDS);
+  return hasAnyRole(member, EMPLOYEE_ROLE_IDS);
+}
+
+function hasManagerPosition(member) {
+  return hasAnyRole(member, MANAGER_POSITION_ROLE_IDS);
+}
+
+function canUseEmployeeFunctions(member) {
+  return isEmployee(member) || canManage(member);
 }
 
 function formatName(rawName) {
@@ -377,6 +428,33 @@ function parseGermanDate(input) {
     2,
     "0"
   )}`;
+}
+
+function parseStrictGermanDate(input) {
+  const clean = String(input || "").trim();
+
+  // Für Abmeldungen ist exakt TT.MM.JJJJ vorgeschrieben.
+  if (!/^\d{2}\.\d{2}\.\d{4}$/.test(clean)) {
+    return null;
+  }
+
+  return parseGermanDate(clean);
+}
+
+function getTodayIsoInTimeZone(
+  timeZone = SETTINGS.timezone
+) {
+  const { year, month, day } =
+    getCurrentDatePartsInTimeZone(timeZone);
+
+  return `${year}-${String(month).padStart(2, "0")}-${String(
+    day
+  ).padStart(2, "0")}`;
+}
+
+function formatIsoDateGerman(isoDate) {
+  const [year, month, day] = String(isoDate).split("-");
+  return `${day}.${month}.${year}`;
 }
 
 function parsePositiveMinutes(input) {
@@ -623,6 +701,7 @@ async function initDatabase() {
       reason TEXT,
       status TEXT NOT NULL DEFAULT 'open',
       message_id TEXT,
+      thread_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
@@ -641,6 +720,11 @@ async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await query(`
+    ALTER TABLE applications
+    ADD COLUMN IF NOT EXISTS thread_id TEXT;
   `);
 
   await query(`
@@ -990,22 +1074,32 @@ function teamUpdateRoleSelect() {
         {
           label: "Probe-Mitarbeiter",
           value: "probation",
-          description: "Vergibt die Probe-Mitarbeiterrolle",
+          description:
+            "Vergibt Probe-Mitarbeiter plus Mitarbeiterzusatzrolle",
         },
         {
           label: "Mitarbeiter",
           value: "employee",
-          description: "Vergibt Mitarbeiter und entfernt Probe-Mitarbeiter",
+          description:
+            "Entfernt Probe-Mitarbeiter und vergibt Mitarbeiter",
         },
         {
-          label: "Management 1",
-          value: "management_1",
-          description: "Vergibt die erste Managementrolle",
+          label: "Probe-Manager",
+          value: "probation_manager",
+          description:
+            "Vergibt Mitarbeiter-, Zusatz- und Verwaltungsrollen",
         },
         {
-          label: "Management 2",
-          value: "management_2",
-          description: "Vergibt die zweite Managementrolle",
+          label: "Manager",
+          value: "manager",
+          description:
+            "Vergibt Mitarbeiter-, Zusatz- und Verwaltungsrollen",
+        },
+        {
+          label: "Personal Manager",
+          value: "personal_manager",
+          description:
+            "Vergibt Mitarbeiter-, Zusatz- und Verwaltungsrollen",
         }
       )
   );
@@ -1143,96 +1237,228 @@ async function postManagementPanel() {
 // DASHBOARD
 // ============================================================
 
+async function getTrackedDashboardMembers() {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  await guild.members.fetch();
+
+  const trackedMembers = guild.members.cache.filter(
+    (member) =>
+      !member.user.bot &&
+      (member.roles.cache.has(ROLES.employee) ||
+        member.roles.cache.has(ROLES.probationEmployee))
+  );
+
+  return {
+    guild,
+    trackedMembers,
+    trackedUserIds: trackedMembers.map((member) => member.id),
+  };
+}
+
 async function buildDashboardEmbed() {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  await guild.members.fetch();
+
+  // Für sämtliche Dashboard-Zahlen und Ranglisten zählen ausschließlich
+  // Mitglieder mit Mitarbeiter- oder Probe-Mitarbeiterrolle.
+  const employeeMembers = guild.members.cache.filter(
+    (member) => !member.user.bot && isEmployee(member)
+  );
+
+  const employeeIds = [...employeeMembers.keys()];
+
   const [
     activeSessions,
-    activeWarnings,
-    employees,
-    absences,
-    weeklyTop,
-    totalTop,
+    warningSummary,
+    absenceSummary,
+    employeeTimes,
   ] = await Promise.all([
     query(
-      `SELECT user_id, started_at FROM active_sessions ORDER BY started_at ASC`
+      `
+        SELECT user_id, started_at
+        FROM active_sessions
+        WHERE user_id = ANY($1::text[])
+        ORDER BY started_at ASC
+      `,
+      [employeeIds]
     ),
     query(
-      `SELECT COUNT(*)::int AS count FROM warning_records WHERE active = TRUE`
+      `
+        SELECT
+          COUNT(*) FILTER (WHERE active = TRUE)::int AS active_count,
+          COUNT(*) FILTER (
+            WHERE active = TRUE
+              AND issued_at <= NOW() - INTERVAL '14 days'
+          )::int AS older_than_14_days
+        FROM warning_records
+        WHERE user_id = ANY($1::text[])
+      `,
+      [employeeIds]
     ),
     query(
-      `SELECT COUNT(*)::int AS count FROM employees WHERE left_server = FALSE`
+      `
+        SELECT COUNT(*)::int AS count
+        FROM absences
+        WHERE user_id = ANY($1::text[])
+          AND date_from <= CURRENT_DATE + INTERVAL '7 days'
+          AND date_to >= CURRENT_DATE
+      `,
+      [employeeIds]
     ),
-    query(`
-      SELECT COUNT(*)::int AS count
-      FROM absences
-      WHERE date_from <= CURRENT_DATE + INTERVAL '7 days'
-        AND date_to >= CURRENT_DATE
-    `),
-    query(`
-      SELECT user_id, weekly_minutes
-      FROM employees
-      WHERE left_server = FALSE
-      ORDER BY weekly_minutes DESC, user_id ASC
-      LIMIT 5
-    `),
-    query(`
-      SELECT user_id, total_minutes
-      FROM employees
-      WHERE left_server = FALSE
-      ORDER BY total_minutes DESC, user_id ASC
-      LIMIT 5
-    `),
+    query(
+      `
+        SELECT user_id, weekly_minutes, total_minutes
+        FROM employees
+        WHERE user_id = ANY($1::text[])
+      `,
+      [employeeIds]
+    ),
   ]);
 
-  const activeList = activeSessions.rows.length
-    ? activeSessions.rows
+  const timeByUser = new Map(
+    employeeTimes.rows.map((row) => [
+      row.user_id,
+      {
+        weekly: Number(row.weekly_minutes) || 0,
+        total: Number(row.total_minutes) || 0,
+      },
+    ])
+  );
+
+  const rankedWeekly = employeeIds
+    .map((userId) => ({
+      userId,
+      minutes: timeByUser.get(userId)?.weekly || 0,
+    }))
+    .sort((a, b) => b.minutes - a.minutes)
+    .slice(0, 5);
+
+  const rankedTotal = employeeIds
+    .map((userId) => ({
+      userId,
+      minutes: timeByUser.get(userId)?.total || 0,
+    }))
+    .sort((a, b) => b.minutes - a.minutes)
+    .slice(0, 5);
+
+  const totalWeeklyMinutes = employeeIds.reduce(
+    (sum, userId) => sum + (timeByUser.get(userId)?.weekly || 0),
+    0
+  );
+
+  const averageWeeklyMinutes =
+    employeeIds.length > 0
+      ? Math.round(totalWeeklyMinutes / employeeIds.length)
+      : 0;
+
+  const activeEmployeeSessions = activeSessions.rows.filter((row) =>
+    employeeMembers.has(row.user_id)
+  );
+
+  const activeList = activeEmployeeSessions.length
+    ? activeEmployeeSessions
         .map(
           (row) =>
-            `• <@${row.user_id}> – seit ${formatDateTime(row.started_at)}`
+            `└ <@${row.user_id}> • seit ${formatDateTime(row.started_at)}`
         )
         .join("\n")
-    : "Aktuell ist niemand im Dienst.";
+    : "└ Niemand ist aktuell eingestempelt.";
 
-  const weeklyList = weeklyTop.rows.length
-    ? weeklyTop.rows
+  const weeklyList = rankedWeekly.length
+    ? rankedWeekly
         .map(
           (row, index) =>
-            `${index + 1}. <@${row.user_id}> – **${formatShortMinutes(
-              row.weekly_minutes
-            )}**`
+            `└ **${index + 1}.** <@${row.userId}> • ${formatShortMinutes(
+              row.minutes
+            )}`
         )
         .join("\n")
-    : "Noch keine Wochenzeiten vorhanden.";
+    : "└ Noch keine Mitarbeiterzeiten vorhanden.";
 
-  const totalList = totalTop.rows.length
-    ? totalTop.rows
+  const totalList = rankedTotal.length
+    ? rankedTotal
         .map(
           (row, index) =>
-            `${index + 1}. <@${row.user_id}> – **${formatShortMinutes(
-              row.total_minutes
-            )}**`
+            `└ **${index + 1}.** <@${row.userId}> • ${formatShortMinutes(
+              row.minutes
+            )}`
         )
         .join("\n")
-    : "Noch keine Gesamtzeiten vorhanden.";
+    : "└ Noch keine Mitarbeiterzeiten vorhanden.";
+
+  const activeWarningCount =
+    Number(warningSummary.rows[0]?.active_count) || 0;
+
+  const oldWarningCount =
+    Number(warningSummary.rows[0]?.older_than_14_days) || 0;
+
+  const absenceCount =
+    Number(absenceSummary.rows[0]?.count) || 0;
+
+  const openTasks = [];
+
+  if (oldWarningCount > 0) {
+    openTasks.push(
+      `└ 🔴 Verwarnungen über 14 Tage prüfen: **${oldWarningCount}**`
+    );
+  }
+
+  if (absenceCount > 0) {
+    openTasks.push(
+      `└ 🟡 Aktuelle/kommende Abmeldungen prüfen: **${absenceCount}**`
+    );
+  }
+
+  if (openTasks.length === 0) {
+    openTasks.push("└ 🟢 Zurzeit sind keine offenen Prüfaufgaben vorhanden.");
+  }
 
   return createBaseEmbed()
     .setTitle("🍸 • TIKI BAR DASHBOARD")
     .setDescription(
       "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-        "Live-Übersicht für Management und Personal.\n\n" +
-        `🟢 **Im Dienst:** ${activeSessions.rows.length}\n` +
-        `⚠️ **Aktive Verwarnungen:** ${
-          activeWarnings.rows[0]?.count || 0
-        }\n` +
-        `👥 **Mitarbeiter in der Liste:** ${
-          employees.rows[0]?.count || 0
-        }\n` +
-        `📅 **Aktuelle/kommende Abmeldungen:** ${
-          absences.rows[0]?.count || 0
-        }\n\n` +
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-        `**🟢 Aktuell im Dienst**\n${activeList}\n\n` +
-        `**📊 Top 5 dieser Woche**\n${weeklyList}\n\n` +
-        `**🏆 Top 5 Gesamtzeit**\n${totalList}\n` +
+        "**Live-Übersicht für Management & Personal Management**\n" +
+        "🟢 Alles gut • 🟡 Prüfen • 🔴 Handeln\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+
+        "👥 **TEAM & ZEITEN**\n\n" +
+        "👥 **Mitarbeiter im Team**\n" +
+        `└ **${employeeIds.length}**\n\n` +
+
+        "🟢 **Aktuell im Dienst**\n" +
+        `└ **${activeEmployeeSessions.length}**\n\n` +
+
+        "📊 **Ø Wochenzeit pro Mitarbeiter**\n" +
+        `└ **${formatShortMinutes(averageWeeklyMinutes)}**\n\n` +
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+
+        "🧑‍💼 **PERSONAL MANAGEMENT**\n\n" +
+        "⚠️ **Aktive Verwarnungen**\n" +
+        `└ **${activeWarningCount}**\n\n` +
+
+        "🕒 **Verwarnungen über 14 Tage**\n" +
+        `└ **${oldWarningCount}**\n\n` +
+
+        "📅 **Abmeldungen diese Woche**\n" +
+        `└ **${absenceCount}**\n\n` +
+
+        "📌 **OFFENE AUFGABEN**\n" +
+        `${openTasks.join("\n")}\n\n` +
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+
+        "📈 **WOCHENZEIT – TOP 5**\n" +
+        `${weeklyList}\n\n` +
+
+        "🏆 **GESAMTZEIT – TOP 5**\n" +
+        `${totalList}\n\n` +
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n" +
+
+        "🟢 **EINGESTEMPELTE MITARBEITER**\n" +
+        `${activeList}\n` +
+
         "━━━━━━━━━━━━━━━━━━━━━━━━"
     );
 }
@@ -1249,6 +1475,8 @@ async function updateDashboardMessage() {
     }
   );
 }
+
+
 
 // ============================================================
 // PERSONALAKTEN
@@ -1510,7 +1738,9 @@ function registrationModal() {
     );
 }
 
-function absenceModal() {
+function absenceModal(defaultName = "") {
+  const safeName = formatName(defaultName).slice(0, 60);
+
   return new ModalBuilder()
     .setCustomId("absence_modal")
     .setTitle("Abmeldung einreichen")
@@ -1520,6 +1750,8 @@ function absenceModal() {
           .setCustomId("absence_name")
           .setLabel("Vor- und Nachname")
           .setStyle(TextInputStyle.Short)
+          .setValue(safeName || "Nicht erkannt")
+          .setMaxLength(60)
           .setRequired(true)
       ),
       new ActionRowBuilder().addComponents(
@@ -1528,6 +1760,8 @@ function absenceModal() {
           .setLabel("Von (TT.MM.JJJJ)")
           .setStyle(TextInputStyle.Short)
           .setPlaceholder("14.07.2026")
+          .setMinLength(10)
+          .setMaxLength(10)
           .setRequired(true)
       ),
       new ActionRowBuilder().addComponents(
@@ -1536,6 +1770,8 @@ function absenceModal() {
           .setLabel("Bis (TT.MM.JJJJ)")
           .setStyle(TextInputStyle.Short)
           .setPlaceholder("20.07.2026")
+          .setMinLength(10)
+          .setMaxLength(10)
           .setRequired(true)
       ),
       new ActionRowBuilder().addComponents(
@@ -1741,21 +1977,46 @@ async function handleRegistration(interaction) {
 // ============================================================
 
 async function handleAbsence(interaction) {
+  // Der Name wird immer aus dem Discord-Serverprofil genommen.
+  // Änderungen im vorausgefüllten Feld werden nicht übernommen.
   const name = formatName(
-    interaction.fields.getTextInputValue("absence_name")
+    interaction.member?.displayName ||
+      interaction.user.globalName ||
+      interaction.user.username
   );
+
   const fromRaw =
     interaction.fields.getTextInputValue("absence_from");
-  const toRaw = interaction.fields.getTextInputValue("absence_to");
+  const toRaw =
+    interaction.fields.getTextInputValue("absence_to");
   const reason =
     interaction.fields.getTextInputValue("absence_reason");
-  const from = parseGermanDate(fromRaw);
-  const to = parseGermanDate(toRaw);
 
-  if (!from || !to || from > to) {
+  const from = parseStrictGermanDate(fromRaw);
+  const to = parseStrictGermanDate(toRaw);
+
+  if (!from || !to) {
     return interaction.reply({
       content:
-        "❌ Bitte gib einen gültigen Zeitraum im Format TT.MM.JJJJ ein.",
+        "❌ Bitte verwende ausschließlich echte Daten im Format **TT.MM.JJJJ**, zum Beispiel `14.07.2026`.",
+      ephemeral: true,
+    });
+  }
+
+  const today = getTodayIsoInTimeZone();
+
+  if (from < today || to < today) {
+    return interaction.reply({
+      content:
+        "❌ Bereits vergangene Tage können nicht für eine Abmeldung ausgewählt werden.",
+      ephemeral: true,
+    });
+  }
+
+  if (from > to) {
+    return interaction.reply({
+      content:
+        "❌ Das Enddatum darf nicht vor dem Startdatum liegen.",
       ephemeral: true,
     });
   }
@@ -1778,7 +2039,12 @@ async function handleAbsence(interaction) {
     .setTitle("❌ • NEUE ABMELDUNG")
     .addFields(
       { name: "👤 Name", value: name },
-      { name: "📅 Zeitraum", value: `${fromRaw} bis ${toRaw}` },
+      {
+        name: "📅 Zeitraum",
+        value:
+          `${formatIsoDateGerman(from)} bis ` +
+          `${formatIsoDateGerman(to)}`,
+      },
       { name: "📝 Grund", value: reason },
       {
         name: "Erstellt von",
@@ -1937,19 +2203,59 @@ async function handleApplication(interaction) {
     components: [row],
   });
 
+  let threadId = null;
+
   if (message) {
+    try {
+      const cleanThreadName = normalizeName(icName)
+        .replace(/\s+/g, "-")
+        .slice(0, 55);
+
+      const thread = await message.startThread({
+        name:
+          `bewerbung-${applicationId}-${cleanThreadName || "bewerber"}`.slice(
+            0,
+            100
+          ),
+        autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+        reason: `Bewerbung #${applicationId} von ${icName}`,
+      });
+
+      threadId = thread.id;
+
+      await thread.members
+        .add(interaction.user.id)
+        .catch(() => null);
+
+      await thread.send({
+        content:
+          `📋 **Bewerbungsgespräch #${applicationId}**\n` +
+          `Bewerber: ${interaction.user}\n` +
+          `IC-Name: **${icName}**\n\n` +
+          "Hier können Rückfragen und das weitere Vorgehen besprochen werden.",
+      });
+    } catch (error) {
+      console.error(
+        `❌ Thread für Bewerbung #${applicationId} konnte nicht erstellt werden:`,
+        error
+      );
+    }
+
     await query(
       `
         UPDATE applications
-        SET message_id = $1
-        WHERE id = $2
+        SET message_id = $1, thread_id = $2
+        WHERE id = $3
       `,
-      [message.id, applicationId]
+      [message.id, threadId, applicationId]
     );
   }
 
   return interaction.reply({
-    content: "✅ Deine Bewerbung wurde eingereicht.",
+    content:
+      threadId
+        ? `✅ Deine Bewerbung wurde eingereicht. Der zugehörige Thread wurde erstellt: <#${threadId}>`
+        : "✅ Deine Bewerbung wurde eingereicht.",
     ephemeral: true,
   });
 }
@@ -2184,39 +2490,95 @@ async function applyTeamUpdate({
   let label = "Unbekannte Position";
 
   if (updateType === "probation") {
-    roleIdsToAdd = [ROLES.probationEmployee];
-    roleIdsToRemove = [ROLES.employee, ...ROLES.management];
+    roleIdsToAdd = [
+      ROLES.probationEmployee,
+      ROLES.employeeAddon,
+    ];
+    roleIdsToRemove = [
+      ROLES.employee,
+      ROLES.probationManager,
+      ...ROLES.management,
+      ROLES.managementAccess,
+    ];
     label = `<@&${ROLES.probationEmployee}>`;
   }
 
   if (updateType === "employee") {
-    roleIdsToAdd = [ROLES.employee];
-    roleIdsToRemove = [ROLES.probationEmployee];
+    roleIdsToAdd = [
+      ROLES.employee,
+      ROLES.employeeAddon,
+    ];
+    roleIdsToRemove = [
+      ROLES.probationEmployee,
+      ROLES.probationManager,
+      ...ROLES.management,
+      ROLES.managementAccess,
+    ];
     label = `<@&${ROLES.employee}>`;
   }
 
-  if (updateType === "management_1") {
-    roleIdsToAdd = [ROLES.employee, ROLES.management[0]];
-    roleIdsToRemove = [ROLES.probationEmployee];
+  if (updateType === "probation_manager") {
+    roleIdsToAdd = [
+      ROLES.employee,
+      ROLES.employeeAddon,
+      ROLES.managementAccess,
+      ROLES.probationManager,
+    ];
+    roleIdsToRemove = [
+      ROLES.probationEmployee,
+      ...ROLES.management,
+    ];
+    label = `<@&${ROLES.probationManager}>`;
+  }
+
+  if (updateType === "manager") {
+    roleIdsToAdd = [
+      ROLES.employee,
+      ROLES.employeeAddon,
+      ROLES.managementAccess,
+      ROLES.management[0],
+    ];
+    roleIdsToRemove = [
+      ROLES.probationEmployee,
+      ROLES.probationManager,
+      ROLES.management[1],
+    ];
     label = `<@&${ROLES.management[0]}>`;
   }
 
-  if (updateType === "management_2") {
-    roleIdsToAdd = [ROLES.employee, ROLES.management[1]];
-    roleIdsToRemove = [ROLES.probationEmployee];
+  if (updateType === "personal_manager") {
+    roleIdsToAdd = [
+      ROLES.employee,
+      ROLES.employeeAddon,
+      ROLES.managementAccess,
+      ROLES.management[1],
+    ];
+    roleIdsToRemove = [
+      ROLES.probationEmployee,
+      ROLES.probationManager,
+      ROLES.management[0],
+    ];
     label = `<@&${ROLES.management[1]}>`;
   }
+
+  if (label === "Unbekannte Position") {
+    throw new Error("Die ausgewählte Position ist ungültig.");
+  }
+
+  suppressRoleSync(targetUserId);
 
   await safeRemoveRoles(
     member,
     roleIdsToRemove,
     `Teamupdate durch ${issuerId}`
   );
+
   await safeAddRoles(
     member,
     roleIdsToAdd,
     `Teamupdate durch ${issuerId}`
   );
+
   await ensureEmployee(targetUserId);
 
   await query(
@@ -2257,6 +2619,8 @@ async function terminateEmployee({
   const member = await guild.members.fetch(targetUserId).catch(() => null);
 
   if (member) {
+    suppressRoleSync(targetUserId, 12_000);
+
     await safeRemoveRoles(
       member,
       TERMINATION_REMOVE_ROLE_IDS,
@@ -3726,7 +4090,7 @@ async function handleButton(interaction) {
 
   if (
     employeeActionButtons.includes(customId) &&
-    !isEmployee(interaction.member)
+    !canUseEmployeeFunctions(interaction.member)
   ) {
     return interaction.reply({
       content:
@@ -3736,7 +4100,12 @@ async function handleButton(interaction) {
   }
 
   if (customId === "open_absence_modal") {
-    return interaction.showModal(absenceModal());
+    const detectedName =
+      interaction.member?.displayName ||
+      interaction.user.globalName ||
+      interaction.user.username;
+
+    return interaction.showModal(absenceModal(detectedName));
   }
 
   if (customId === "open_shopping_modal") {
@@ -3824,14 +4193,42 @@ async function handleButton(interaction) {
     const [action, id] = customId.split(":");
     const accepted = action === "application_accept";
 
-    await query(
+    const applicationUpdate = await query(
       `
         UPDATE applications
         SET status = $2, updated_at = NOW()
         WHERE id = $1
+        RETURNING thread_id, user_id
       `,
       [id, accepted ? "accepted" : "denied"]
     );
+
+    const applicationRecord = applicationUpdate.rows[0] || null;
+
+    if (applicationRecord?.thread_id) {
+      const thread = await client.channels
+        .fetch(applicationRecord.thread_id)
+        .catch(() => null);
+
+      if (thread?.isThread()) {
+        await thread
+          .send({
+            content: accepted
+              ? `✅ Die Bewerbung wurde von ${interaction.user} angenommen.`
+              : `❌ Die Bewerbung wurde von ${interaction.user} abgelehnt.`,
+          })
+          .catch(() => null);
+
+        await thread
+          .setArchived(
+            true,
+            `Bewerbung #${id} wurde ${
+              accepted ? "angenommen" : "abgelehnt"
+            }`
+          )
+          .catch(() => null);
+      }
+    }
 
     const embed = EmbedBuilder.from(interaction.message.embeds[0]);
     const fields = embed.data.fields || [];
@@ -4660,37 +5057,116 @@ client.on(
   Events.GuildMemberUpdate,
   async (oldMember, newMember) => {
     if (newMember.guild.id !== GUILD_ID) return;
+    if (isRoleSyncSuppressed(newMember.id)) return;
 
-    const hadTeamRole = hasAnyRole(oldMember, TEAM_ROLE_IDS);
-    const hasTeamRole = hasAnyRole(newMember, TEAM_ROLE_IDS);
+    try {
+      const hadEmployeeRole = isEmployee(oldMember);
+      const hasEmployeeRole = isEmployee(newMember);
 
-    if (!hadTeamRole && hasTeamRole) {
-      await ensureEmployee(newMember.id);
+      const hadManagerRole = hasManagerPosition(oldMember);
+      const hasManagerRole = hasManagerPosition(newMember);
+
+      const employeeWasAdded =
+        !oldMember.roles.cache.has(ROLES.employee) &&
+        newMember.roles.cache.has(ROLES.employee);
+
+      // Wer direkt Probe-Manager, Manager oder Personal Manager wird,
+      // erhält automatisch normale Mitarbeiterrolle, Zusatzrolle
+      // und Verwaltungsrolle. Probe-Mitarbeiter wird entfernt.
+      if (hasManagerRole) {
+        await safeAddRoles(
+          newMember,
+          [
+            ROLES.employee,
+            ROLES.employeeAddon,
+            ROLES.managementAccess,
+          ],
+          "Automatische Rollenverknüpfung für Management"
+        );
+
+        await safeRemoveRoles(
+          newMember,
+          ROLES.probationEmployee,
+          "Management erhält die normale Mitarbeiterrolle"
+        );
+      } else if (hasEmployeeRole) {
+        // Probe-Mitarbeiter und Mitarbeiter erhalten immer
+        // die Mitarbeiterzusatzrolle.
+        await safeAddRoles(
+          newMember,
+          ROLES.employeeAddon,
+          "Automatische Mitarbeiterzusatzrolle"
+        );
+
+        // Beim Aufstieg von Probe-Mitarbeiter zu Mitarbeiter
+        // wird Probe-Mitarbeiter automatisch entfernt.
+        if (employeeWasAdded) {
+          await safeRemoveRoles(
+            newMember,
+            ROLES.probationEmployee,
+            "Aufstieg zum Mitarbeiter"
+          );
+        }
+      }
+
+      // Wenn die letzte Managementposition entfernt wurde,
+      // wird auch die Verwaltungsrolle entfernt.
+      if (hadManagerRole && !hasManagerRole) {
+        await safeRemoveRoles(
+          newMember,
+          ROLES.managementAccess,
+          "Keine Managementposition mehr vorhanden"
+        );
+      }
+
+      // Wenn weder Mitarbeiter- noch Managementposition vorhanden ist,
+      // wird auch die Mitarbeiterzusatzrolle entfernt.
+      if (!hasEmployeeRole && !hasManagerRole) {
+        await safeRemoveRoles(
+          newMember,
+          ROLES.employeeAddon,
+          "Keine Mitarbeiterposition mehr vorhanden"
+        );
+      }
+
+      const shouldCountAsEmployee =
+        hasEmployeeRole || hasManagerRole;
+
+      const countedBefore =
+        hadEmployeeRole || hadManagerRole;
+
+      if (!countedBefore && shouldCountAsEmployee) {
+        await ensureEmployee(newMember.id);
+      }
+
+      if (countedBefore && !shouldCountAsEmployee) {
+        await query(
+          `
+            UPDATE employees
+            SET left_server = TRUE, updated_at = NOW()
+            WHERE user_id = $1
+          `,
+          [newMember.id]
+        );
+
+        await query(
+          `DELETE FROM active_sessions WHERE user_id = $1`,
+          [newMember.id]
+        );
+
+        await safeRemoveRoles(
+          newMember,
+          ROLES.onDuty,
+          "Keine Mitarbeiter- oder Managementposition mehr vorhanden"
+        );
+      }
+
       await updateDashboardMessage().catch(() => null);
-    }
-
-    if (hadTeamRole && !hasTeamRole) {
-      await query(
-        `
-          UPDATE employees
-          SET left_server = TRUE, updated_at = NOW()
-          WHERE user_id = $1
-        `,
-        [newMember.id]
+    } catch (error) {
+      console.error(
+        `❌ Automatische Rollensynchronisierung für ${newMember.id} fehlgeschlagen:`,
+        error
       );
-
-      await query(
-        `DELETE FROM active_sessions WHERE user_id = $1`,
-        [newMember.id]
-      );
-
-      await safeRemoveRoles(
-        newMember,
-        ROLES.onDuty,
-        "Keine Teamrolle mehr vorhanden"
-      );
-
-      await updateDashboardMessage().catch(() => null);
     }
   }
 );
