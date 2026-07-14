@@ -165,7 +165,7 @@ const CHANNELS = Object.freeze({
 
   // Solange kein eigener Bewerbungskanal vorhanden ist,
   // werden Bewerbungen im Teamupdate-Kanal ausgegeben.
-  applications: "1526427758358433879",
+  applications: "1526427758622670884",
 
   houseBans: "1526427758622670886",
   teamUpdates: "1526427758358433879",
