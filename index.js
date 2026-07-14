@@ -1246,16 +1246,16 @@ async function postManagementPanel() {
     .setDescription(
       "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
         `Verwalte hier das Team der **${BRAND.name}**.\n\n` +
-        "⚠️ **Verwarnung**\n" +
-        "└ Verwarnung ausstellen.\n\n" +
+        "🧠 **Einweisung**\n" +
+        "└ Eine Einweisung dokumentieren.\n\n" +
         "🔄 **Teamupdate**\n" +
         "└ Rollen und Positionen aktualisieren.\n\n" +
         "📤 **Kündigung**\n" +
         "└ Mitarbeiter aus dem Team entfernen.\n\n" +
+        "⚠️ **Verwarnung**\n" +
+        "└ Verwarnung ausstellen.\n\n" +
         "✅ **Verwarnung zurückziehen**\n" +
         "└ Eine aktive Verwarnung entfernen.\n\n" +
-        "🧠 **Einweisung**\n" +
-        "└ Eine Einweisung dokumentieren.\n\n" +
         "⏱️ **Zeitverwaltung**\n" +
         "└ Arbeitszeiten ansehen oder korrigieren.\n" +
         "━━━━━━━━━━━━━━━━━━━━━━━━"
