@@ -1,0 +1,27 @@
+{
+  "name": "tiki-bar-assistent",
+  "version": "1.0.0",
+  "description": "Discord Managementsystem für die Tiki Bar",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "discord",
+    "tiki-bar",
+    "management",
+    "foodbusiness"
+  ],
+  "author": "Kquwi",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.26.5",
+    "dotenv": "^17.4.2",
+    "pg": "^8.22.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "type": "commonjs"
+}
