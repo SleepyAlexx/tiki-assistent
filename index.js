@@ -1042,10 +1042,10 @@ function employeePanelButtons() {
 function managementPanelRows() {
   const firstRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId("mgmt_warning_start")
-      .setLabel("Verwarnung")
-      .setEmoji("⚠️")
-      .setStyle(ButtonStyle.Danger),
+      .setCustomId("mgmt_training_start")
+      .setLabel("Einweisung")
+      .setEmoji("🧠")
+      .setStyle(ButtonStyle.Success),
 
     new ButtonBuilder()
       .setCustomId("mgmt_teamupdate_start")
@@ -1062,16 +1062,16 @@ function managementPanelRows() {
 
   const secondRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
+      .setCustomId("mgmt_warning_start")
+      .setLabel("Verwarnung")
+      .setEmoji("⚠️")
+      .setStyle(ButtonStyle.Danger),
+
+    new ButtonBuilder()
       .setCustomId("mgmt_warning_remove_start")
       .setLabel("Verwarnung zurückziehen")
       .setEmoji("✅")
       .setStyle(ButtonStyle.Primary),
-
-    new ButtonBuilder()
-      .setCustomId("mgmt_training_start")
-      .setLabel("Einweisung")
-      .setEmoji("🧠")
-      .setStyle(ButtonStyle.Success),
 
     new ButtonBuilder()
       .setCustomId("mgmt_time_start")
