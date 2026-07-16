@@ -26,6 +26,7 @@ const {
   StringSelectMenuBuilder,
   ThreadAutoArchiveDuration,
   ChannelType,
+  MessageFlags,
 } = require("discord.js");
 
 const { Pool } = require("pg");
@@ -249,6 +250,11 @@ const employeeRosterCache = {
 };
 
 const EMPLOYEE_ROSTER_CACHE_TTL_MS = 60_000;
+
+// Mehrere gleichzeitige Dashboard-/Sync-Aufrufe verwenden denselben
+// laufenden Mitarbeiterabgleich. Dadurch entstehen keine parallelen
+// Discord-Abfragen und keine mehrfachen Rate-Limit-Wartezeiten.
+let employeeRosterRefreshPromise = null;
 
 // Verhindert, dass automatische Rollensynchronisierung während
 // einer Kündigung oder eines Teamupdates Rollen wieder hinzufügt.
@@ -1385,7 +1391,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getRateLimitRetryMs(error, fallbackMs = 30_000) {
+function getRateLimitRetryMs(error, fallbackMs = 5_000) {
   const rawRetryAfter =
     error?.rawError?.retry_after ??
     error?.data?.retry_after ??
@@ -1394,7 +1400,6 @@ function getRateLimitRetryMs(error, fallbackMs = 30_000) {
   if (Number.isFinite(Number(rawRetryAfter))) {
     const value = Number(rawRetryAfter);
 
-    // Discord liefert retry_after je nach Fehler in Sekunden.
     return value > 1_000
       ? Math.ceil(value)
       : Math.ceil(value * 1_000);
@@ -1408,29 +1413,6 @@ function getRateLimitRetryMs(error, fallbackMs = 30_000) {
   }
 
   return fallbackMs;
-}
-
-async function getExpectedTrackedRoleCounts(guild) {
-  const counts = await guild.roles
-    .fetchMemberCounts()
-    .catch((error) => {
-      console.warn(
-        "⚠️ Rollen-Mitgliederzahlen konnten nicht geladen werden:",
-        error.message
-      );
-      return null;
-    });
-
-  if (!counts) {
-    return null;
-  }
-
-  return {
-    employee:
-      Number(counts.get(ROLES.employee)) || 0,
-    probationEmployee:
-      Number(counts.get(ROLES.probationEmployee)) || 0,
-  };
 }
 
 function countTrackedRoles(members) {
@@ -1459,13 +1441,12 @@ function countTrackedRoles(members) {
   };
 }
 
-async function fetchAllGuildMembersWithRetry(
-  maxAttempts = 5
-) {
-  const guild =
-    client.guilds.cache.get(GUILD_ID) ||
-    (await client.guilds.fetch(GUILD_ID));
-
+async function listGuildMemberPageWithRetry({
+  guild,
+  after,
+  maxAttempts,
+  pageNumber,
+}) {
   let lastError = null;
 
   for (
@@ -1474,37 +1455,11 @@ async function fetchAllGuildMembersWithRetry(
     attempt += 1
   ) {
     try {
-      const expectedCounts =
-        await getExpectedTrackedRoleCounts(guild);
-
-      // Offizieller discord.js-Weg zum Laden aller Mitglieder.
-      const members = await guild.members.fetch();
-      const actualCounts = countTrackedRoles(members);
-
-      if (
-        expectedCounts &&
-        (
-          actualCounts.employee !==
-            expectedCounts.employee ||
-          actualCounts.probationEmployee !==
-            expectedCounts.probationEmployee
-        )
-      ) {
-        throw new Error(
-          "Unvollständige Mitgliederliste: " +
-            `Mitarbeiter ${actualCounts.employee}/` +
-            `${expectedCounts.employee}, Probe-Mitarbeiter ` +
-            `${actualCounts.probationEmployee}/` +
-            `${expectedCounts.probationEmployee}.`
-        );
-      }
-
-      return {
-        guild,
-        members,
-        expectedCounts,
-        actualCounts,
-      };
+      return await guild.members.list({
+        limit: 1_000,
+        after,
+        cache: true,
+      });
     } catch (error) {
       lastError = error;
 
@@ -1513,13 +1468,12 @@ async function fetchAllGuildMembersWithRetry(
       }
 
       const waitMs =
-        getRateLimitRetryMs(error) + 1_500;
+        getRateLimitRetryMs(error) + 1_000;
 
       console.warn(
-        `⚠️ Mitarbeiterliste unvollständig ` +
+        `⚠️ Mitgliederseite ${pageNumber} konnte nicht geladen werden ` +
           `(Versuch ${attempt}/${maxAttempts}). ` +
-          `Neuer Versuch in ` +
-          `${Math.ceil(waitMs / 1_000)} Sekunden.`
+          `Neuer Versuch in ${Math.ceil(waitMs / 1_000)} Sekunden.`
       );
 
       await sleep(waitMs);
@@ -1529,9 +1483,72 @@ async function fetchAllGuildMembersWithRetry(
   throw (
     lastError ||
     new Error(
-      "Die Servermitglieder konnten nicht geladen werden."
+      `Mitgliederseite ${pageNumber} konnte nicht geladen werden.`
     )
   );
+}
+
+async function fetchAllGuildMembersWithRetry(
+  maxAttempts = 3
+) {
+  const guild =
+    client.guilds.cache.get(GUILD_ID) ||
+    (await client.guilds.fetch(GUILD_ID));
+
+  const members = new Map();
+  let after;
+  let pageNumber = 1;
+
+  // guild.members.list() lädt über den REST-Endpunkt jeweils bis zu
+  // 1000 Mitglieder. Durch Pagination wird die Serverliste vollständig
+  // geladen, ohne den Gateway-Opcode-8-Fetch mehrfach auszulösen.
+  while (true) {
+    const page =
+      await listGuildMemberPageWithRetry({
+        guild,
+        after,
+        maxAttempts,
+        pageNumber,
+      });
+
+    for (const [userId, member] of page) {
+      members.set(userId, member);
+    }
+
+    if (page.size < 1_000) {
+      break;
+    }
+
+    const pageIds = [...page.keys()];
+    const nextAfter =
+      pageIds[pageIds.length - 1];
+
+    if (!nextAfter || nextAfter === after) {
+      throw new Error(
+        "Die Mitglieder-Pagination konnte nicht fortgesetzt werden."
+      );
+    }
+
+    after = nextAfter;
+    pageNumber += 1;
+
+    const reasonableMaximumPages =
+      Math.ceil(
+        Math.max(guild.memberCount, members.size) / 1_000
+      ) + 5;
+
+    if (pageNumber > reasonableMaximumPages) {
+      throw new Error(
+        "Die Mitglieder-Pagination wurde aus Sicherheitsgründen beendet."
+      );
+    }
+  }
+
+  return {
+    guild,
+    members,
+    actualCounts: countTrackedRoles(members),
+  };
 }
 
 async function persistEmployeeRoster(employeeIds) {
@@ -1590,36 +1607,12 @@ async function persistEmployeeRoster(employeeIds) {
   return uniqueIds;
 }
 
-async function refreshEmployeeRoster({
-  force = false,
-  maxAttempts = 5,
-} = {}) {
-  const cacheAge =
-    Date.now() -
-    employeeRosterCache.lastRefreshAt;
-
-  if (
-    !force &&
-    employeeRosterCache.lastRefreshAt > 0 &&
-    cacheAge <
-      EMPLOYEE_ROSTER_CACHE_TTL_MS
-  ) {
-    return {
-      userIds: new Set(
-        employeeRosterCache.userIds
-      ),
-      count:
-        employeeRosterCache.userIds.size,
-      source:
-        employeeRosterCache.lastSource,
-    };
-  }
-
+async function performEmployeeRosterRefresh(
+  maxAttempts
+) {
   try {
     const {
-      guild,
       members,
-      expectedCounts,
       actualCounts,
     } =
       await fetchAllGuildMembersWithRetry(
@@ -1649,16 +1642,14 @@ async function refreshEmployeeRoster({
     employeeRosterCache.lastRefreshAt =
       Date.now();
     employeeRosterCache.lastSource =
-      "Discord-Rollen vollständig geprüft";
+      "Discord-REST-Mitgliederliste";
 
     console.log(
       `✅ Mitarbeiter-Roster: ` +
         `${persistedIds.length} eindeutig erkannt ` +
-        `(Mitarbeiter ${actualCounts.employee}` +
-        `${expectedCounts ? `/${expectedCounts.employee}` : ""}, ` +
-        `Probe-Mitarbeiter ` +
-        `${actualCounts.probationEmployee}` +
-        `${expectedCounts ? `/${expectedCounts.probationEmployee}` : ""}).`
+        `(Mitarbeiterrolle: ${actualCounts.employee}, ` +
+        `Probe-Mitarbeiterrolle: ` +
+        `${actualCounts.probationEmployee}).`
     );
 
     return {
@@ -1701,6 +1692,47 @@ async function refreshEmployeeRoster({
       source:
         employeeRosterCache.lastSource,
     };
+  }
+}
+
+async function refreshEmployeeRoster({
+  force = false,
+  maxAttempts = 3,
+} = {}) {
+  const cacheAge =
+    Date.now() -
+    employeeRosterCache.lastRefreshAt;
+
+  if (
+    !force &&
+    employeeRosterCache.lastRefreshAt > 0 &&
+    cacheAge <
+      EMPLOYEE_ROSTER_CACHE_TTL_MS
+  ) {
+    return {
+      userIds: new Set(
+        employeeRosterCache.userIds
+      ),
+      count:
+        employeeRosterCache.userIds.size,
+      source:
+        employeeRosterCache.lastSource,
+    };
+  }
+
+  if (employeeRosterRefreshPromise) {
+    return employeeRosterRefreshPromise;
+  }
+
+  employeeRosterRefreshPromise =
+    performEmployeeRosterRefresh(
+      maxAttempts
+    );
+
+  try {
+    return await employeeRosterRefreshPromise;
+  } finally {
+    employeeRosterRefreshPromise = null;
   }
 }
 
@@ -2788,7 +2820,7 @@ async function handleRegistration(interaction) {
     return interaction.reply({
       content:
         "❌ Der vollständige Name muss zwischen 5 und 32 Zeichen lang sein.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -2845,7 +2877,7 @@ async function handleRegistration(interaction) {
       `✅ Registrierung als **${fullName}** abgeschlossen.\n` +
       nicknameResult +
       failedRoles,
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -2876,7 +2908,7 @@ async function handleAbsence(interaction) {
     return interaction.reply({
       content:
         "❌ Bitte verwende ausschließlich echte Daten im Format **TT.MM.JJJJ**, zum Beispiel `14.07.2026`.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -2886,7 +2918,7 @@ async function handleAbsence(interaction) {
     return interaction.reply({
       content:
         "❌ Bereits vergangene Tage können nicht für eine Abmeldung ausgewählt werden.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -2894,7 +2926,7 @@ async function handleAbsence(interaction) {
     return interaction.reply({
       content:
         "❌ Das Enddatum darf nicht vor dem Startdatum liegen.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -2934,7 +2966,7 @@ async function handleAbsence(interaction) {
 
   return interaction.reply({
     content: "✅ Deine Abmeldung wurde eingetragen.",
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -3005,7 +3037,7 @@ async function handleShopping(interaction) {
 
   return interaction.reply({
     content: "✅ Der Einkauf wurde eingetragen.",
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -3133,7 +3165,7 @@ async function handleApplication(interaction) {
       threadId
         ? `✅ Deine Bewerbung wurde eingereicht. Der zugehörige Thread wurde erstellt: <#${threadId}>`
         : "✅ Deine Bewerbung wurde eingereicht.",
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -3214,7 +3246,7 @@ async function handleHouseBan(interaction) {
 
   return interaction.reply({
     content: "✅ Das Hausverbot wurde dokumentiert.",
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -4406,7 +4438,7 @@ async function createDutyCorrection(interaction) {
   if (!session.rows[0]) {
     return interaction.reply({
       content: "❌ Dieser Mitarbeiter hat keinen aktiven Dienst.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -4417,7 +4449,7 @@ async function createDutyCorrection(interaction) {
     return interaction.reply({
       content:
         "❌ Die Endzeit ist ungültig oder liegt vor dem Dienstbeginn.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -4476,7 +4508,7 @@ async function createDutyCorrection(interaction) {
   return interaction.reply({
     embeds: [embed],
     components: [row],
-    ephemeral: true,
+    flags: MessageFlags.Ephemeral,
   });
 }
 
@@ -4500,7 +4532,7 @@ async function bookDutyCorrection(interaction, token) {
   ) {
     return interaction.reply({
       content: "❌ Du darfst diese Korrektur nicht bestätigen.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -4837,7 +4869,7 @@ async function handleChatInputCommand(interaction) {
 
     return interaction.reply({
       embeds: [embed],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -4869,7 +4901,7 @@ async function handleChatInputCommand(interaction) {
 
     return interaction.reply({
       embeds: [embed],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -4898,12 +4930,12 @@ async function handleChatInputCommand(interaction) {
   ) {
     return interaction.reply({
       content: "❌ Du darfst diesen Command nicht benutzen.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   if (interaction.commandName === "registrierungspanel") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     await postRegistrationPanel();
 
     return interaction.editReply(
@@ -4912,7 +4944,7 @@ async function handleChatInputCommand(interaction) {
   }
 
   if (interaction.commandName === "mitarbeiterpanel") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     await postEmployeePanel();
 
     return interaction.editReply(
@@ -4921,7 +4953,7 @@ async function handleChatInputCommand(interaction) {
   }
 
   if (interaction.commandName === "managementpanel") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     await postManagementPanel();
 
     return interaction.editReply(
@@ -4930,7 +4962,7 @@ async function handleChatInputCommand(interaction) {
   }
 
   if (interaction.commandName === "dashboard") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     await refreshEmployeeRoster({
       force: true,
@@ -4945,7 +4977,7 @@ async function handleChatInputCommand(interaction) {
   }
 
   if (interaction.commandName === "mitarbeiter-sync") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const roster = await refreshEmployeeRoster({
       force: true,
@@ -4969,7 +5001,7 @@ async function handleChatInputCommand(interaction) {
       interaction.options.getUser("user");
 
     await interaction.deferReply({
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
 
     const repairedRows =
@@ -5001,7 +5033,7 @@ async function handleChatInputCommand(interaction) {
       interaction.options.getUser("user");
 
     await interaction.deferReply({
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
 
     const guild =
@@ -5155,11 +5187,11 @@ async function handleChatInputCommand(interaction) {
       return interaction.reply({
         content:
           "❌ Bitte wähle einen normalen Textkanal aus.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const type =
       interaction.commandName === "wochenzeiten"
@@ -5180,7 +5212,7 @@ async function handleChatInputCommand(interaction) {
 
   if (interaction.commandName === "akte") {
     const target = interaction.options.getUser("user");
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     await sendPersonalFileToChannel(
       target.id,
       interaction.user.id
@@ -5214,7 +5246,7 @@ async function handleChatInputCommand(interaction) {
 
     return interaction.reply({
       content: `✅ Die Notiz wurde zur Personalakte von ${target} hinzugefügt.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5224,7 +5256,7 @@ async function handleChatInputCommand(interaction) {
 
     return interaction.reply({
       embeds: [embed],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5233,7 +5265,7 @@ async function handleChatInputCommand(interaction) {
   }
 
   if (interaction.commandName === "dienst-reset") {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const guild = await client.guilds.fetch(GUILD_ID);
     const activeSessions = await query(
@@ -5277,7 +5309,7 @@ async function handleChatInputCommand(interaction) {
       content:
         `✅ ${result.checked} aktive Verwarnungen geprüft.\n` +
         `🧹 ${result.deactivated} veraltete Datensätze deaktiviert.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5291,7 +5323,7 @@ async function handleChatInputCommand(interaction) {
         `• Foodbusiness-Geldlogs: ${result.money}\n` +
         `• Alte Abmeldungen: ${result.absences}\n` +
         `• Alte Diensthinweise: ${result.alerts}`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 }
@@ -5313,7 +5345,7 @@ async function handleButton(interaction) {
     ) {
       return interaction.reply({
         content: "❌ Diese Zeitübersicht ist ungültig.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -5349,7 +5381,7 @@ async function handleButton(interaction) {
     return interaction.reply({
       content:
         "❌ Diese Funktion ist nur für Mitarbeiter und das Management verfügbar.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5385,7 +5417,7 @@ async function handleButton(interaction) {
     if (!canManage(interaction.member)) {
       return interaction.reply({
         content: "❌ Du darfst diese Verwaltungsaktion nicht benutzen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
   }
@@ -5544,7 +5576,7 @@ async function handleButton(interaction) {
     return interaction.reply({
       content: "Wähle den Mitarbeiter für die Verwarnung aus:",
       components: [userSelect("mgmt_warning_user")],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5556,7 +5588,7 @@ async function handleButton(interaction) {
     if (!draft?.targetUserId || !draft?.warningRoleId) {
       return interaction.reply({
         content: "❌ Die Verwarnungsauswahl ist abgelaufen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -5585,7 +5617,7 @@ async function handleButton(interaction) {
     return interaction.reply({
       content: "Wähle den Mitarbeiter für das Teamupdate aus:",
       components: [userSelect("mgmt_teamupdate_user")],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5597,7 +5629,7 @@ async function handleButton(interaction) {
     return interaction.reply({
       content: "Wähle den Mitarbeiter für die Kündigung aus:",
       components: [userSelect("mgmt_termination_user")],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5609,7 +5641,7 @@ async function handleButton(interaction) {
     if (!draft?.targetUserId) {
       return interaction.reply({
         content: "❌ Die Auswahl ist abgelaufen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -5639,7 +5671,7 @@ async function handleButton(interaction) {
       content:
         "Wähle den Mitarbeiter, dessen Verwarnung zurückgezogen werden soll:",
       components: [userSelect("mgmt_warning_remove_user")],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5651,7 +5683,7 @@ async function handleButton(interaction) {
     return interaction.reply({
       content: "Wähle den eingewiesenen Mitarbeiter aus:",
       components: [userSelect("mgmt_training_target")],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5663,7 +5695,7 @@ async function handleButton(interaction) {
     if (!draft?.targetUserId || !draft?.instructorId) {
       return interaction.reply({
         content: "❌ Die Auswahl ist abgelaufen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -5690,7 +5722,7 @@ async function handleButton(interaction) {
     return interaction.reply({
       content: "Wähle den Mitarbeiter für die Zeitverwaltung aus:",
       components: [userSelect("time_target_user")],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5700,7 +5732,7 @@ async function handleButton(interaction) {
     if (!draft?.targetUserId || !draft?.action) {
       return interaction.reply({
         content: "❌ Die Auswahl ist abgelaufen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -5745,7 +5777,7 @@ async function handleButton(interaction) {
     ) {
       return interaction.reply({
         content: "❌ Du darfst diese Korrektur nicht abbrechen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -5768,7 +5800,7 @@ async function handleUserSelect(interaction) {
   if (!canManage(interaction.member)) {
     return interaction.reply({
       content: "❌ Du darfst diese Auswahl nicht benutzen.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -5885,7 +5917,7 @@ async function handleStringSelect(interaction) {
   if (!canManage(interaction.member)) {
     return interaction.reply({
       content: "❌ Du darfst diese Auswahl nicht benutzen.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -6044,7 +6076,7 @@ async function handleModal(interaction) {
   if (!canManage(interaction.member)) {
     return interaction.reply({
       content: "❌ Du darfst dieses Formular nicht absenden.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -6055,7 +6087,7 @@ async function handleModal(interaction) {
     if (!draft?.targetUserId || !draft?.warningRoleId) {
       return interaction.reply({
         content: "❌ Die Verwarnungsauswahl ist abgelaufen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -6073,7 +6105,7 @@ async function handleModal(interaction) {
 
     return interaction.reply({
       content: `✅ Die Verwarnung für <@${draft.targetUserId}> wurde ausgestellt.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -6087,7 +6119,7 @@ async function handleModal(interaction) {
     if (!draft?.targetUserId) {
       return interaction.reply({
         content: "❌ Die Auswahl ist abgelaufen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -6104,7 +6136,7 @@ async function handleModal(interaction) {
 
     return interaction.reply({
       content: `✅ Die Kündigung von <@${draft.targetUserId}> wurde dokumentiert.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -6115,7 +6147,7 @@ async function handleModal(interaction) {
     if (!draft?.targetUserId || !draft?.instructorId) {
       return interaction.reply({
         content: "❌ Die Auswahl ist abgelaufen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -6126,7 +6158,7 @@ async function handleModal(interaction) {
       return interaction.reply({
         content:
           "❌ Bitte gib das Datum im Format TT.MM.JJJJ ein.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -6141,7 +6173,7 @@ async function handleModal(interaction) {
 
     return interaction.reply({
       content: "✅ Die Einweisung wurde dokumentiert.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -6153,7 +6185,7 @@ async function handleModal(interaction) {
     if (!draft?.targetUserId || !draft?.action) {
       return interaction.reply({
         content: "❌ Die Auswahl ist abgelaufen.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -6168,7 +6200,7 @@ async function handleModal(interaction) {
       return interaction.reply({
         content:
           "❌ Bitte gib eine gültige positive Minutenzahl ein.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -6189,7 +6221,7 @@ async function handleModal(interaction) {
           result.newWeekly
         )}**\n` +
         `Gesamt: **${formatShortMinutes(result.newTotal)}**`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 }
@@ -6225,7 +6257,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const payload = {
       content:
         "❌ Bei der Verarbeitung ist ein unerwarteter Fehler aufgetreten.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     };
 
     if (interaction.replied || interaction.deferred) {
