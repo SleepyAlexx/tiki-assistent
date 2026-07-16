@@ -965,6 +965,18 @@ async function registerCommands() {
       ),
 
     new SlashCommandBuilder()
+      .setName("arbeitszeit-check")
+      .setDescription(
+        "Prüft Rollen, Datenbank und Foodbusiness-Buchungen eines Mitarbeiters."
+      )
+      .addUserOption((option) =>
+        option
+          .setName("user")
+          .setDescription("Mitarbeiter auswählen")
+          .setRequired(true)
+      ),
+
+    new SlashCommandBuilder()
       .setName("wochenzeiten")
       .setDescription(
         "Sendet die Wochenzeiten-Übersicht in einen gewünschten Kanal."
@@ -1398,8 +1410,57 @@ function getRateLimitRetryMs(error, fallbackMs = 30_000) {
   return fallbackMs;
 }
 
+async function getExpectedTrackedRoleCounts(guild) {
+  const counts = await guild.roles
+    .fetchMemberCounts()
+    .catch((error) => {
+      console.warn(
+        "⚠️ Rollen-Mitgliederzahlen konnten nicht geladen werden:",
+        error.message
+      );
+      return null;
+    });
+
+  if (!counts) {
+    return null;
+  }
+
+  return {
+    employee:
+      Number(counts.get(ROLES.employee)) || 0,
+    probationEmployee:
+      Number(counts.get(ROLES.probationEmployee)) || 0,
+  };
+}
+
+function countTrackedRoles(members) {
+  let employee = 0;
+  let probationEmployee = 0;
+
+  for (const member of members.values()) {
+    if (member.user.bot) continue;
+
+    if (member.roles.cache.has(ROLES.employee)) {
+      employee += 1;
+    }
+
+    if (
+      member.roles.cache.has(
+        ROLES.probationEmployee
+      )
+    ) {
+      probationEmployee += 1;
+    }
+  }
+
+  return {
+    employee,
+    probationEmployee,
+  };
+}
+
 async function fetchAllGuildMembersWithRetry(
-  maxAttempts = 4
+  maxAttempts = 5
 ) {
   const guild =
     client.guilds.cache.get(GUILD_ID) ||
@@ -1407,15 +1468,42 @@ async function fetchAllGuildMembersWithRetry(
 
   let lastError = null;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt += 1
+  ) {
     try {
-      const members = await guild.members.fetch({
-        time: 120_000,
-      });
+      const expectedCounts =
+        await getExpectedTrackedRoleCounts(guild);
+
+      // Offizieller discord.js-Weg zum Laden aller Mitglieder.
+      const members = await guild.members.fetch();
+      const actualCounts = countTrackedRoles(members);
+
+      if (
+        expectedCounts &&
+        (
+          actualCounts.employee !==
+            expectedCounts.employee ||
+          actualCounts.probationEmployee !==
+            expectedCounts.probationEmployee
+        )
+      ) {
+        throw new Error(
+          "Unvollständige Mitgliederliste: " +
+            `Mitarbeiter ${actualCounts.employee}/` +
+            `${expectedCounts.employee}, Probe-Mitarbeiter ` +
+            `${actualCounts.probationEmployee}/` +
+            `${expectedCounts.probationEmployee}.`
+        );
+      }
 
       return {
         guild,
         members,
+        expectedCounts,
+        actualCounts,
       };
     } catch (error) {
       lastError = error;
@@ -1428,101 +1516,156 @@ async function fetchAllGuildMembersWithRetry(
         getRateLimitRetryMs(error) + 1_500;
 
       console.warn(
-        `⚠️ Mitglieder konnten nicht vollständig geladen werden ` +
+        `⚠️ Mitarbeiterliste unvollständig ` +
           `(Versuch ${attempt}/${maxAttempts}). ` +
-          `Neuer Versuch in ${Math.ceil(waitMs / 1_000)} Sekunden.`
+          `Neuer Versuch in ` +
+          `${Math.ceil(waitMs / 1_000)} Sekunden.`
       );
 
       await sleep(waitMs);
     }
   }
 
-  throw lastError || new Error(
-    "Die Servermitglieder konnten nicht geladen werden."
+  throw (
+    lastError ||
+    new Error(
+      "Die Servermitglieder konnten nicht geladen werden."
+    )
   );
+}
+
+async function persistEmployeeRoster(employeeIds) {
+  const uniqueIds = [...new Set(employeeIds)];
+
+  await withTransaction(async (databaseClient) => {
+    if (uniqueIds.length > 0) {
+      await databaseClient.query(
+        `
+          INSERT INTO employees (
+            user_id,
+            total_minutes,
+            weekly_minutes,
+            left_server,
+            updated_at
+          )
+          SELECT
+            roster.user_id,
+            0,
+            0,
+            FALSE,
+            NOW()
+          FROM UNNEST($1::text[]) AS roster(user_id)
+          ON CONFLICT (user_id)
+          DO UPDATE SET
+            left_server = FALSE,
+            updated_at = NOW();
+        `,
+        [uniqueIds]
+      );
+
+      await databaseClient.query(
+        `
+          UPDATE employees
+          SET
+            left_server = TRUE,
+            updated_at = NOW()
+          WHERE NOT (
+            user_id = ANY($1::text[])
+          );
+        `,
+        [uniqueIds]
+      );
+    } else {
+      await databaseClient.query(
+        `
+          UPDATE employees
+          SET
+            left_server = TRUE,
+            updated_at = NOW();
+        `
+      );
+    }
+  });
+
+  return uniqueIds;
 }
 
 async function refreshEmployeeRoster({
   force = false,
-  maxAttempts = 4,
+  maxAttempts = 5,
 } = {}) {
   const cacheAge =
-    Date.now() - employeeRosterCache.lastRefreshAt;
+    Date.now() -
+    employeeRosterCache.lastRefreshAt;
 
   if (
     !force &&
     employeeRosterCache.lastRefreshAt > 0 &&
-    cacheAge < EMPLOYEE_ROSTER_CACHE_TTL_MS
+    cacheAge <
+      EMPLOYEE_ROSTER_CACHE_TTL_MS
   ) {
     return {
-      userIds: new Set(employeeRosterCache.userIds),
-      count: employeeRosterCache.userIds.size,
-      source: employeeRosterCache.lastSource,
+      userIds: new Set(
+        employeeRosterCache.userIds
+      ),
+      count:
+        employeeRosterCache.userIds.size,
+      source:
+        employeeRosterCache.lastSource,
     };
   }
 
   try {
-    const { guild, members } =
-      await fetchAllGuildMembersWithRetry(maxAttempts);
+    const {
+      guild,
+      members,
+      expectedCounts,
+      actualCounts,
+    } =
+      await fetchAllGuildMembersWithRetry(
+        maxAttempts
+      );
 
     const employeeIds = [];
 
     for (const member of members.values()) {
-      if (member.user.bot || !isEmployee(member)) {
+      if (
+        member.user.bot ||
+        !isEmployee(member)
+      ) {
         continue;
       }
 
       employeeIds.push(member.id);
     }
 
-    for (const userId of employeeIds) {
-      await ensureEmployee(userId);
-    }
-
-    // Erst nach einer erfolgreich vollständig geladenen Mitgliederliste
-    // werden nicht mehr berechtigte Datensätze deaktiviert.
-    if (employeeIds.length > 0) {
-      await query(
-        `
-          UPDATE employees
-          SET left_server = TRUE, updated_at = NOW()
-          WHERE NOT (user_id = ANY($1::text[]));
-        `,
-        [employeeIds]
+    const persistedIds =
+      await persistEmployeeRoster(
+        employeeIds
       );
-    } else {
-      await query(
-        `
-          UPDATE employees
-          SET left_server = TRUE, updated_at = NOW();
-        `
-      );
-    }
 
     employeeRosterCache.userIds =
-      new Set(employeeIds);
-    employeeRosterCache.lastRefreshAt = Date.now();
+      new Set(persistedIds);
+    employeeRosterCache.lastRefreshAt =
+      Date.now();
     employeeRosterCache.lastSource =
-      "Discord-Rollen vollständig geladen";
-
-    const employeeRoleCount =
-      guild.roles.cache.get(ROLES.employee)?.members.size || 0;
-
-    const probationRoleCount =
-      guild.roles.cache.get(ROLES.probationEmployee)
-        ?.members.size || 0;
+      "Discord-Rollen vollständig geprüft";
 
     console.log(
-      `✅ Mitarbeiter-Roster aktualisiert: ` +
-        `${employeeIds.length} eindeutig erkannt ` +
-        `(Mitarbeiterrolle: ${employeeRoleCount}, ` +
-        `Probe-Mitarbeiterrolle: ${probationRoleCount}).`
+      `✅ Mitarbeiter-Roster: ` +
+        `${persistedIds.length} eindeutig erkannt ` +
+        `(Mitarbeiter ${actualCounts.employee}` +
+        `${expectedCounts ? `/${expectedCounts.employee}` : ""}, ` +
+        `Probe-Mitarbeiter ` +
+        `${actualCounts.probationEmployee}` +
+        `${expectedCounts ? `/${expectedCounts.probationEmployee}` : ""}).`
     );
 
     return {
-      userIds: new Set(employeeIds),
-      count: employeeIds.length,
-      source: employeeRosterCache.lastSource,
+      userIds: new Set(persistedIds),
+      count: persistedIds.length,
+      source:
+        employeeRosterCache.lastSource,
     };
   } catch (error) {
     console.error(
@@ -1530,38 +1673,33 @@ async function refreshEmployeeRoster({
       error
     );
 
-    if (employeeRosterCache.userIds.size > 0) {
-      employeeRosterCache.lastSource =
-        "Letzter erfolgreicher Discord-Sync";
-
-      return {
-        userIds: new Set(employeeRosterCache.userIds),
-        count: employeeRosterCache.userIds.size,
-        source: employeeRosterCache.lastSource,
-      };
-    }
-
     const fallback = await query(
       `
         SELECT user_id
         FROM employees
         WHERE left_server = FALSE
+        ORDER BY user_id ASC
       `
     );
 
     const fallbackIds = new Set(
-      fallback.rows.map((row) => row.user_id)
+      fallback.rows.map(
+        (row) => row.user_id
+      )
     );
 
-    employeeRosterCache.userIds = fallbackIds;
-    employeeRosterCache.lastRefreshAt = Date.now();
+    employeeRosterCache.userIds =
+      fallbackIds;
+    employeeRosterCache.lastRefreshAt =
+      Date.now();
     employeeRosterCache.lastSource =
-      "Datenbank-Fallback";
+      "Datenbank-Fallback nach Sync-Fehler";
 
     return {
       userIds: new Set(fallbackIds),
       count: fallbackIds.size,
-      source: employeeRosterCache.lastSource,
+      source:
+        employeeRosterCache.lastSource,
     };
   }
 }
@@ -1571,22 +1709,40 @@ async function getTrackedDashboardMembers() {
     client.guilds.cache.get(GUILD_ID) ||
     (await client.guilds.fetch(GUILD_ID));
 
-  const roster = await refreshEmployeeRoster();
+  // Die Datenbank ist nach einem erfolgreichen Rollen-Sync
+  // die stabile Quelle. Dadurch verschwinden Mitarbeiter
+  // nicht aus dem Leaderboard, wenn Discord den Member-Cache
+  // vorübergehend nur teilweise liefert.
+  const result = await query(
+    `
+      SELECT user_id
+      FROM employees
+      WHERE left_server = FALSE
+      ORDER BY user_id ASC
+    `
+  );
 
-  // Map statt Collection: .has(userId) funktioniert auch dann,
-  // wenn Discord einen einzelnen Member noch nicht im Cache hält.
+  const trackedUserIds =
+    result.rows.map((row) => row.user_id);
+
+  employeeRosterCache.userIds =
+    new Set(trackedUserIds);
+
   const trackedMembers = new Map(
-    [...roster.userIds].map((userId) => [
+    trackedUserIds.map((userId) => [
       userId,
-      guild.members.cache.get(userId) || null,
+      guild.members.cache.get(userId) ||
+        null,
     ])
   );
 
   return {
     guild,
     trackedMembers,
-    trackedUserIds: [...roster.userIds],
-    rosterSource: roster.source,
+    trackedUserIds,
+    rosterSource:
+      employeeRosterCache.lastSource ||
+      "Datenbank",
   };
 }
 
@@ -2106,6 +2262,45 @@ async function repairEmployeeTimesFromSessions(
   targetUserId = null
 ) {
   const weekStart = getCurrentWeekStartDateTime();
+
+  // Ältere Bot-Versionen konnten eine Foodbusiness-Meldung
+  // bereits als verarbeitet markieren, ohne eine Work-Session
+  // anzulegen. Diese Einträge werden zuerst rekonstruiert.
+  await query(
+    `
+      INSERT INTO work_sessions (
+        user_id,
+        ic_name,
+        started_at,
+        ended_at,
+        minutes,
+        corrected,
+        correction_reason,
+        source_message_id
+      )
+      SELECT
+        processed.user_id,
+        processed.ic_name,
+        processed.created_at -
+          (processed.minutes * INTERVAL '1 minute'),
+        processed.created_at,
+        processed.minutes,
+        TRUE,
+        'Aus verarbeitetem Foodbusiness-Log rekonstruiert',
+        processed.message_id
+      FROM foodbusiness_processed_logs processed
+      WHERE processed.action = 'clock_out'
+        AND processed.processing_status = 'assigned'
+        AND processed.user_id IS NOT NULL
+        AND processed.minutes > 0
+        AND (
+          $1::text IS NULL OR
+          processed.user_id = $1
+        )
+      ON CONFLICT DO NOTHING;
+    `,
+    [targetUserId]
+  );
 
   const result = await query(
     `
@@ -3606,11 +3801,10 @@ function extractFoodbusinessDurationMinutes(text) {
   return Math.max(1, Math.ceil(totalSeconds / 60));
 }
 
-async function findMemberByIcName(guild, icName) {
-  await guild.members.fetch().catch(() => null);
-
+function findExactMemberMatches(guild, icName) {
   const normalizedTarget = normalizeName(icName);
-  const exactMatches = guild.members.cache.filter((member) => {
+
+  return guild.members.cache.filter((member) => {
     if (member.user.bot) return false;
 
     const possibleNames = [
@@ -3624,9 +3818,35 @@ async function findMemberByIcName(guild, icName) {
 
     return possibleNames.includes(normalizedTarget);
   });
+}
+
+async function findMemberByIcName(guild, icName) {
+  let exactMatches =
+    findExactMemberMatches(guild, icName);
+
+  if (exactMatches.size === 0) {
+    await guild.members.fetch().catch((error) => {
+      console.warn(
+        "⚠️ Mitglieder konnten für die Namenszuordnung nicht vollständig geladen werden:",
+        error.message
+      );
+    });
+
+    exactMatches =
+      findExactMemberMatches(guild, icName);
+  }
 
   if (exactMatches.size === 1) {
     return exactMatches.first();
+  }
+
+  if (exactMatches.size > 1) {
+    const employeeMatches =
+      exactMatches.filter(isEmployee);
+
+    if (employeeMatches.size === 1) {
+      return employeeMatches.first();
+    }
   }
 
   return null;
@@ -3704,14 +3924,61 @@ async function sendUnresolvedFoodbusinessLog({
   await sendEmbed(CHANNELS.dutyLogs, embed);
 }
 
+async function ensureFoodbusinessEmployeeEligibility({
+  message,
+  member,
+  icName,
+  action,
+  durationMinutes,
+  originalText,
+}) {
+  if (isEmployee(member)) {
+    await ensureEmployee(member.id);
+
+    employeeRosterCache.userIds.add(member.id);
+    employeeRosterCache.lastRefreshAt = Date.now();
+    employeeRosterCache.lastSource =
+      "Foodbusiness-Zuordnung mit Mitarbeiterrolle";
+
+    return true;
+  }
+
+  await saveFoodbusinessProcessed({
+    messageId: message.id,
+    userId: member.id,
+    icName,
+    action,
+    minutes: durationMinutes || 0,
+    status: "ignored_missing_employee_role",
+    originalText,
+  });
+
+  const embed = createBaseEmbed(0xfee75c)
+    .setTitle("⚠️ • FOODBUSINESS NICHT GEBUCHT")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `👤 **IC-Name**\n└ ${icName}\n\n` +
+        `👥 **Discord-User**\n└ ${member}\n\n` +
+        "❌ **Grund**\n" +
+        "└ Die Person besitzt weder die Mitarbeiter- noch die Probe-Mitarbeiterrolle.\n\n" +
+        "📌 **Folge**\n" +
+        "└ Die Arbeitszeit wurde nicht in Wochen- oder Gesamtzeit übernommen.\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    .setFooter({
+      text: "Tiki Bar • Foodbusiness Rollenprüfung",
+    });
+
+  await sendEmbed(CHANNELS.dutyLogs, embed);
+  return false;
+}
+
 async function handleFoodbusinessClockIn({
   message,
   member,
   icName,
   originalText,
 }) {
-  await ensureEmployee(member.id);
-
   await query(
     `
       INSERT INTO active_sessions (
@@ -3778,8 +4045,6 @@ async function handleFoodbusinessClockOut({
   durationMinutes,
   originalText,
 }) {
-  await ensureEmployee(member.id);
-
   const sessionResult = await query(
     `
       SELECT started_at
@@ -3807,9 +4072,10 @@ async function handleFoodbusinessClockOut({
 
   const minutes = durationMinutes || calculatedMinutes;
 
-  await withTransaction(async (databaseClient) => {
-    await databaseClient.query(
-      `
+  const bookingTotals = await withTransaction(
+    async (databaseClient) => {
+      await databaseClient.query(
+        `
         INSERT INTO work_sessions (
           user_id,
           ic_name,
@@ -3831,34 +4097,44 @@ async function handleFoodbusinessClockOut({
       ]
     );
 
-    await creditEmployeeMinutes(
-      databaseClient,
-      member.id,
-      minutes
-    );
+      const totals =
+        await creditEmployeeMinutes(
+          databaseClient,
+          member.id,
+          minutes
+        );
 
-    await databaseClient.query(
-      `DELETE FROM active_sessions WHERE user_id = $1`,
-      [member.id]
-    );
+      await databaseClient.query(
+        `DELETE FROM active_sessions WHERE user_id = $1`,
+        [member.id]
+      );
 
-    await databaseClient.query(
-      `
-        INSERT INTO foodbusiness_processed_logs (
-          message_id,
-          user_id,
-          ic_name,
-          action,
+      await databaseClient.query(
+        `
+          INSERT INTO foodbusiness_processed_logs (
+            message_id,
+            user_id,
+            ic_name,
+            action,
+            minutes,
+            processing_status,
+            original_text
+          )
+          VALUES ($1, $2, $3, 'clock_out', $4, 'assigned', $5)
+          ON CONFLICT (message_id) DO NOTHING;
+        `,
+        [
+          message.id,
+          member.id,
+          icName,
           minutes,
-          processing_status,
-          original_text
-        )
-        VALUES ($1, $2, $3, 'clock_out', $4, 'assigned', $5)
-        ON CONFLICT (message_id) DO NOTHING;
-      `,
-      [message.id, member.id, icName, minutes, originalText]
-    );
-  });
+          originalText,
+        ]
+      );
+
+      return totals;
+    }
+  );
 
   await safeRemoveRoles(
     member,
@@ -3878,6 +4154,13 @@ async function handleFoodbusinessClockOut({
         `👤 **IC-Name**\n└ ${icName}\n\n` +
         `👥 **Discord-User**\n└ ${member}\n\n` +
         `⏱️ **Arbeitszeit**\n└ ${formatShortMinutes(minutes)}\n\n` +
+        `📥 **Gebucht**\n└ ${formatShortMinutes(minutes)} wurden übernommen.\n\n` +
+        `📊 **Wochenzeit**\n└ ${formatShortMinutes(
+          bookingTotals.weeklyMinutes
+        )}\n\n` +
+        `🏆 **Gesamtzeit**\n└ ${formatShortMinutes(
+          bookingTotals.totalMinutes
+        )}\n\n` +
         "🔴 **Aktion**\n" +
         "└ Im-Dienst-Rolle wurde entfernt.\n\n" +
         "🛠️ **Zuordnung**\n" +
@@ -3953,6 +4236,20 @@ async function processFoodbusinessTimeMessage(message) {
       originalText,
     });
 
+    return;
+  }
+
+  const eligible =
+    await ensureFoodbusinessEmployeeEligibility({
+      message,
+      member,
+      icName,
+      action,
+      durationMinutes,
+      originalText,
+    });
+
+  if (!eligible) {
     return;
   }
 
@@ -4561,6 +4858,8 @@ async function handleChatInputCommand(interaction) {
           "└ Mitarbeiterrollen vollständig neu einlesen\n\n" +
           "🧰 `/arbeitszeiten-reparieren`\n" +
           "└ Fehlende alte Zeitbuchungen aus gespeicherten Diensten übernehmen\n\n" +
+          "🔎 `/arbeitszeit-check`\n" +
+          "└ Rollen, Datenbank und letzte Foodbusiness-Buchungen prüfen\n\n" +
           "🔧 `/dienst-korrektur`\n" +
           "└ Aktiven Dienst nach Crash korrekt abschließen\n\n" +
           "📁 `/akte`, `/personalnotiz`, `/mitarbeitercheck`\n" +
@@ -4581,6 +4880,7 @@ async function handleChatInputCommand(interaction) {
     "dashboard",
     "mitarbeiter-sync",
     "arbeitszeiten-reparieren",
+    "arbeitszeit-check",
     "wochenzeiten",
     "gesamtzeiten",
     "akte",
@@ -4696,6 +4996,149 @@ async function handleChatInputCommand(interaction) {
     );
   }
 
+  if (interaction.commandName === "arbeitszeit-check") {
+    const target =
+      interaction.options.getUser("user");
+
+    await interaction.deferReply({
+      ephemeral: true,
+    });
+
+    const guild =
+      client.guilds.cache.get(GUILD_ID) ||
+      (await client.guilds.fetch(GUILD_ID));
+
+    const member = await guild.members
+      .fetch({
+        user: target.id,
+        force: true,
+      })
+      .catch(() => null);
+
+    const [
+      employeeResult,
+      activeResult,
+      sessionResult,
+      processedResult,
+    ] = await Promise.all([
+      query(
+        `
+          SELECT
+            weekly_minutes,
+            total_minutes,
+            left_server,
+            updated_at
+          FROM employees
+          WHERE user_id = $1
+        `,
+        [target.id]
+      ),
+      query(
+        `
+          SELECT started_at, ic_name
+          FROM active_sessions
+          WHERE user_id = $1
+        `,
+        [target.id]
+      ),
+      query(
+        `
+          SELECT
+            COUNT(*)::int AS session_count,
+            COALESCE(SUM(minutes), 0)::int AS session_minutes,
+            MAX(ended_at) AS last_ended_at
+          FROM work_sessions
+          WHERE user_id = $1
+        `,
+        [target.id]
+      ),
+      query(
+        `
+          SELECT
+            action,
+            minutes,
+            processing_status,
+            created_at
+          FROM foodbusiness_processed_logs
+          WHERE user_id = $1
+          ORDER BY created_at DESC
+          LIMIT 3
+        `,
+        [target.id]
+      ),
+    ]);
+
+    const employeeRow =
+      employeeResult.rows[0] || null;
+    const activeRow =
+      activeResult.rows[0] || null;
+    const sessionRow =
+      sessionResult.rows[0] || null;
+
+    const processedText =
+      processedResult.rows.length > 0
+        ? processedResult.rows
+            .map(
+              (row) =>
+                `└ ${row.action} • ` +
+                `${formatShortMinutes(row.minutes)} • ` +
+                `${row.processing_status}`
+            )
+            .join("\n")
+        : "└ Keine Foodbusiness-Buchung gefunden.";
+
+    const embed = createBaseEmbed()
+      .setTitle("🔎 • ARBEITSZEIT-CHECK")
+      .setDescription(
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+          `👤 **Mitarbeiter**\n└ ${target}\n\n` +
+          "🎭 **Rollenprüfung**\n" +
+          `└ Mitarbeiter: ${
+            member?.roles.cache.has(ROLES.employee)
+              ? "✅"
+              : "❌"
+          }\n` +
+          `└ Probe-Mitarbeiter: ${
+            member?.roles.cache.has(
+              ROLES.probationEmployee
+            )
+              ? "✅"
+              : "❌"
+          }\n\n` +
+          "🗄️ **Datenbank**\n" +
+          `└ Aktiv geführt: ${
+            employeeRow && !employeeRow.left_server
+              ? "✅"
+              : "❌"
+          }\n` +
+          `└ Wochenzeit: ${formatShortMinutes(
+            employeeRow?.weekly_minutes || 0
+          )}\n` +
+          `└ Gesamtzeit: ${formatShortMinutes(
+            employeeRow?.total_minutes || 0
+          )}\n\n` +
+          "⏱️ **Gespeicherte Dienste**\n" +
+          `└ Anzahl: ${sessionRow?.session_count || 0}\n` +
+          `└ Summe: ${formatShortMinutes(
+            sessionRow?.session_minutes || 0
+          )}\n` +
+          `└ Aktiver Dienst: ${
+            activeRow
+              ? `✅ seit ${formatDateTime(
+                  activeRow.started_at
+                )}`
+              : "❌"
+          }\n\n` +
+          "📨 **Letzte Foodbusiness-Verarbeitungen**\n" +
+          `${processedText}\n` +
+          "━━━━━━━━━━━━━━━━━━━━━━━━"
+      );
+
+    return interaction.editReply({
+      embeds: [embed],
+    });
+  }
+
   if (
     interaction.commandName === "wochenzeiten" ||
     interaction.commandName === "gesamtzeiten"
@@ -4717,11 +5160,6 @@ async function handleChatInputCommand(interaction) {
     }
 
     await interaction.deferReply({ ephemeral: true });
-
-    await refreshEmployeeRoster({
-      force: true,
-      maxAttempts: 5,
-    });
 
     const type =
       interaction.commandName === "wochenzeiten"
@@ -5948,17 +6386,16 @@ client.on(
         );
       }
 
-      const shouldCountAsEmployee =
-        hasEmployeeRole || hasManagerRole;
+      // Für Dashboard und Leaderboards zählen wirklich nur
+      // Mitarbeiter- oder Probe-Mitarbeiterrolle. Management
+      // wird durch die automatische Rollenverknüpfung ebenfalls
+      // mit der normalen Mitarbeiterrolle ausgestattet.
+      const currentlyEmployee = isEmployee(newMember);
 
-      const countedBefore =
-        hadEmployeeRole || hadManagerRole;
-
-      if (!countedBefore && shouldCountAsEmployee) {
+      if (currentlyEmployee) {
         await ensureEmployee(newMember.id);
-      }
-
-      if (countedBefore && !shouldCountAsEmployee) {
+        employeeRosterCache.userIds.add(newMember.id);
+      } else {
         await query(
           `
             UPDATE employees
@@ -5968,33 +6405,27 @@ client.on(
           [newMember.id]
         );
 
-        await query(
-          `DELETE FROM active_sessions WHERE user_id = $1`,
-          [newMember.id]
-        );
-
-        await safeRemoveRoles(
-          newMember,
-          ROLES.onDuty,
-          "Keine Mitarbeiter- oder Managementposition mehr vorhanden"
-        );
-      }
-
-      const currentlyEmployee =
-        newMember.roles.cache.has(ROLES.employee) ||
-        newMember.roles.cache.has(ROLES.probationEmployee);
-
-      if (currentlyEmployee) {
-        employeeRosterCache.userIds.add(newMember.id);
-      } else {
         employeeRosterCache.userIds.delete(newMember.id);
+
+        if (hadEmployeeRole) {
+          await query(
+            `DELETE FROM active_sessions WHERE user_id = $1`,
+            [newMember.id]
+          );
+
+          await safeRemoveRoles(
+            newMember,
+            ROLES.onDuty,
+            "Keine Mitarbeiter- oder Probe-Mitarbeiterrolle mehr vorhanden"
+          );
+        }
       }
 
       employeeRosterCache.lastRefreshAt = Date.now();
       employeeRosterCache.lastSource =
         "Discord-Rollenänderung";
 
-      await updateDashboardMessage().catch(() => null);
+      await updateTimeOverviewMessages().catch(() => null);
     } catch (error) {
       console.error(
         `❌ Automatische Rollensynchronisierung für ${newMember.id} fehlgeschlagen:`,
