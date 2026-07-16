@@ -240,6 +240,16 @@ const managementDrafts = new Map();
 const dutyCorrectionDrafts = new Map();
 const timeManagementDrafts = new Map();
 
+// Zuverlässiger Zwischenspeicher für alle Mitglieder mit
+// Mitarbeiter- oder Probe-Mitarbeiterrolle.
+const employeeRosterCache = {
+  userIds: new Set(),
+  lastRefreshAt: 0,
+  lastSource: "Noch nicht geladen",
+};
+
+const EMPLOYEE_ROSTER_CACHE_TTL_MS = 60_000;
+
 // Verhindert, dass automatische Rollensynchronisierung während
 // einer Kündigung oder eines Teamupdates Rollen wieder hinzufügt.
 const roleSyncSuppressedUntil = new Map();
@@ -871,6 +881,12 @@ async function registerCommands() {
       .setDescription("Aktualisiert das Tiki-Bar-Dashboard."),
 
     new SlashCommandBuilder()
+      .setName("mitarbeiter-sync")
+      .setDescription(
+        "Lädt Mitarbeiter- und Probe-Mitarbeiterrollen vollständig neu."
+      ),
+
+    new SlashCommandBuilder()
       .setName("wochenzeiten")
       .setDescription(
         "Sendet die Wochenzeiten-Übersicht in einen gewünschten Kanal."
@@ -1275,26 +1291,224 @@ async function postManagementPanel() {
 // DASHBOARD UND ZEITÜBERSICHTEN
 // ============================================================
 
-async function getTrackedDashboardMembers() {
-  const guild = await client.guilds.fetch(GUILD_ID);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  // Die Mitglieder wurden beim Start bereits synchronisiert.
-  // Nur wenn der Cache praktisch leer ist, wird erneut geladen.
-  if (guild.members.cache.size <= 1) {
-    await guild.members.fetch();
+function getRateLimitRetryMs(error, fallbackMs = 30_000) {
+  const rawRetryAfter =
+    error?.rawError?.retry_after ??
+    error?.data?.retry_after ??
+    error?.retry_after;
+
+  if (Number.isFinite(Number(rawRetryAfter))) {
+    const value = Number(rawRetryAfter);
+
+    // Discord liefert retry_after je nach Fehler in Sekunden.
+    return value > 1_000
+      ? Math.ceil(value)
+      : Math.ceil(value * 1_000);
   }
 
-  const trackedMembers = guild.members.cache.filter(
-    (member) =>
-      !member.user.bot &&
-      (member.roles.cache.has(ROLES.employee) ||
-        member.roles.cache.has(ROLES.probationEmployee))
+  const match = String(error?.message || "")
+    .match(/Retry after\s+([0-9.]+)\s+seconds?/i);
+
+  if (match) {
+    return Math.ceil(Number(match[1]) * 1_000);
+  }
+
+  return fallbackMs;
+}
+
+async function fetchAllGuildMembersWithRetry(
+  maxAttempts = 4
+) {
+  const guild =
+    client.guilds.cache.get(GUILD_ID) ||
+    (await client.guilds.fetch(GUILD_ID));
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const members = await guild.members.fetch({
+        time: 120_000,
+      });
+
+      return {
+        guild,
+        members,
+      };
+    } catch (error) {
+      lastError = error;
+
+      if (attempt >= maxAttempts) {
+        break;
+      }
+
+      const waitMs =
+        getRateLimitRetryMs(error) + 1_500;
+
+      console.warn(
+        `⚠️ Mitglieder konnten nicht vollständig geladen werden ` +
+          `(Versuch ${attempt}/${maxAttempts}). ` +
+          `Neuer Versuch in ${Math.ceil(waitMs / 1_000)} Sekunden.`
+      );
+
+      await sleep(waitMs);
+    }
+  }
+
+  throw lastError || new Error(
+    "Die Servermitglieder konnten nicht geladen werden."
+  );
+}
+
+async function refreshEmployeeRoster({
+  force = false,
+  maxAttempts = 4,
+} = {}) {
+  const cacheAge =
+    Date.now() - employeeRosterCache.lastRefreshAt;
+
+  if (
+    !force &&
+    employeeRosterCache.lastRefreshAt > 0 &&
+    cacheAge < EMPLOYEE_ROSTER_CACHE_TTL_MS
+  ) {
+    return {
+      userIds: new Set(employeeRosterCache.userIds),
+      count: employeeRosterCache.userIds.size,
+      source: employeeRosterCache.lastSource,
+    };
+  }
+
+  try {
+    const { guild, members } =
+      await fetchAllGuildMembersWithRetry(maxAttempts);
+
+    const employeeIds = [];
+
+    for (const member of members.values()) {
+      if (member.user.bot || !isEmployee(member)) {
+        continue;
+      }
+
+      employeeIds.push(member.id);
+    }
+
+    for (const userId of employeeIds) {
+      await ensureEmployee(userId);
+    }
+
+    // Erst nach einer erfolgreich vollständig geladenen Mitgliederliste
+    // werden nicht mehr berechtigte Datensätze deaktiviert.
+    if (employeeIds.length > 0) {
+      await query(
+        `
+          UPDATE employees
+          SET left_server = TRUE, updated_at = NOW()
+          WHERE NOT (user_id = ANY($1::text[]));
+        `,
+        [employeeIds]
+      );
+    } else {
+      await query(
+        `
+          UPDATE employees
+          SET left_server = TRUE, updated_at = NOW();
+        `
+      );
+    }
+
+    employeeRosterCache.userIds =
+      new Set(employeeIds);
+    employeeRosterCache.lastRefreshAt = Date.now();
+    employeeRosterCache.lastSource =
+      "Discord-Rollen vollständig geladen";
+
+    const employeeRoleCount =
+      guild.roles.cache.get(ROLES.employee)?.members.size || 0;
+
+    const probationRoleCount =
+      guild.roles.cache.get(ROLES.probationEmployee)
+        ?.members.size || 0;
+
+    console.log(
+      `✅ Mitarbeiter-Roster aktualisiert: ` +
+        `${employeeIds.length} eindeutig erkannt ` +
+        `(Mitarbeiterrolle: ${employeeRoleCount}, ` +
+        `Probe-Mitarbeiterrolle: ${probationRoleCount}).`
+    );
+
+    return {
+      userIds: new Set(employeeIds),
+      count: employeeIds.length,
+      source: employeeRosterCache.lastSource,
+    };
+  } catch (error) {
+    console.error(
+      "❌ Vollständiger Mitarbeiter-Sync fehlgeschlagen:",
+      error
+    );
+
+    if (employeeRosterCache.userIds.size > 0) {
+      employeeRosterCache.lastSource =
+        "Letzter erfolgreicher Discord-Sync";
+
+      return {
+        userIds: new Set(employeeRosterCache.userIds),
+        count: employeeRosterCache.userIds.size,
+        source: employeeRosterCache.lastSource,
+      };
+    }
+
+    const fallback = await query(
+      `
+        SELECT user_id
+        FROM employees
+        WHERE left_server = FALSE
+      `
+    );
+
+    const fallbackIds = new Set(
+      fallback.rows.map((row) => row.user_id)
+    );
+
+    employeeRosterCache.userIds = fallbackIds;
+    employeeRosterCache.lastRefreshAt = Date.now();
+    employeeRosterCache.lastSource =
+      "Datenbank-Fallback";
+
+    return {
+      userIds: new Set(fallbackIds),
+      count: fallbackIds.size,
+      source: employeeRosterCache.lastSource,
+    };
+  }
+}
+
+async function getTrackedDashboardMembers() {
+  const guild =
+    client.guilds.cache.get(GUILD_ID) ||
+    (await client.guilds.fetch(GUILD_ID));
+
+  const roster = await refreshEmployeeRoster();
+
+  // Map statt Collection: .has(userId) funktioniert auch dann,
+  // wenn Discord einen einzelnen Member noch nicht im Cache hält.
+  const trackedMembers = new Map(
+    [...roster.userIds].map((userId) => [
+      userId,
+      guild.members.cache.get(userId) || null,
+    ])
   );
 
   return {
     guild,
     trackedMembers,
-    trackedUserIds: [...trackedMembers.keys()],
+    trackedUserIds: [...roster.userIds],
+    rosterSource: roster.source,
   };
 }
 
@@ -3985,37 +4199,12 @@ async function checkStaleDuties() {
 }
 
 async function syncTeamMembers() {
-  const guild = await client.guilds.fetch(GUILD_ID);
-  await guild.members.fetch();
+  const roster = await refreshEmployeeRoster({
+    force: true,
+    maxAttempts: 5,
+  });
 
-  const activeTeamIds = [];
-
-  for (const member of guild.members.cache.values()) {
-    if (member.user.bot || !isEmployee(member)) continue;
-
-    activeTeamIds.push(member.id);
-    await ensureEmployee(member.id);
-  }
-
-  if (activeTeamIds.length > 0) {
-    await query(
-      `
-        UPDATE employees
-        SET left_server = TRUE, updated_at = NOW()
-        WHERE NOT (user_id = ANY($1::text[]));
-      `,
-      [activeTeamIds]
-    );
-  } else {
-    await query(
-      `
-        UPDATE employees
-        SET left_server = TRUE, updated_at = NOW();
-      `
-    );
-  }
-
-  return activeTeamIds.length;
+  return roster.count;
 }
 
 // ============================================================
@@ -4085,6 +4274,8 @@ async function handleChatInputCommand(interaction) {
           "└ Verwarnungen, Teamupdates, Kündigungen, Einweisungen und Zeitverwaltung\n\n" +
           "📊 `/wochenzeiten` und `/gesamtzeiten`\n" +
           "└ Zeitübersichten im aktuellen oder ausgewählten Kanal senden\n\n" +
+          "🔄 `/mitarbeiter-sync`\n" +
+          "└ Mitarbeiterrollen vollständig neu einlesen\n\n" +
           "🔧 `/dienst-korrektur`\n" +
           "└ Aktiven Dienst nach Crash korrekt abschließen\n\n" +
           "📁 `/akte`, `/personalnotiz`, `/mitarbeitercheck`\n" +
@@ -4103,6 +4294,7 @@ async function handleChatInputCommand(interaction) {
     "managementpanel",
     "registrierungspanel",
     "dashboard",
+    "mitarbeiter-sync",
     "wochenzeiten",
     "gesamtzeiten",
     "akte",
@@ -4153,10 +4345,33 @@ async function handleChatInputCommand(interaction) {
 
   if (interaction.commandName === "dashboard") {
     await interaction.deferReply({ ephemeral: true });
+
+    await refreshEmployeeRoster({
+      force: true,
+      maxAttempts: 5,
+    });
+
     await updateDashboardOverview();
 
     return interaction.editReply(
       `✅ Das Dashboard wurde in <#${CHANNELS.dashboard}> aktualisiert.`
+    );
+  }
+
+  if (interaction.commandName === "mitarbeiter-sync") {
+    await interaction.deferReply({ ephemeral: true });
+
+    const roster = await refreshEmployeeRoster({
+      force: true,
+      maxAttempts: 5,
+    });
+
+    await updateDashboardOverview().catch(() => null);
+
+    return interaction.editReply(
+      `✅ **${roster.count} Mitarbeiter** wurden anhand der ` +
+        `Mitarbeiter- und Probe-Mitarbeiterrolle erkannt.\n` +
+        `Quelle: **${roster.source}**`
     );
   }
 
@@ -4181,6 +4396,11 @@ async function handleChatInputCommand(interaction) {
     }
 
     await interaction.deferReply({ ephemeral: true });
+
+    await refreshEmployeeRoster({
+      force: true,
+      maxAttempts: 5,
+    });
 
     const type =
       interaction.commandName === "wochenzeiten"
@@ -5303,6 +5523,9 @@ client.on(Events.GuildMemberAdd, async (member) => {
 client.on(Events.GuildMemberRemove, async (member) => {
   if (member.guild.id !== GUILD_ID) return;
 
+  employeeRosterCache.userIds.delete(member.id);
+  employeeRosterCache.lastRefreshAt = Date.now();
+
   await query(
     `
       UPDATE employees
@@ -5436,6 +5659,20 @@ client.on(
         );
       }
 
+      const currentlyEmployee =
+        newMember.roles.cache.has(ROLES.employee) ||
+        newMember.roles.cache.has(ROLES.probationEmployee);
+
+      if (currentlyEmployee) {
+        employeeRosterCache.userIds.add(newMember.id);
+      } else {
+        employeeRosterCache.userIds.delete(newMember.id);
+      }
+
+      employeeRosterCache.lastRefreshAt = Date.now();
+      employeeRosterCache.lastSource =
+        "Discord-Rollenänderung";
+
       await updateDashboardMessage().catch(() => null);
     } catch (error) {
       console.error(
@@ -5500,6 +5737,9 @@ client.once(Events.ClientReady, async (readyClient) => {
     updateBotStatus();
     setInterval(updateBotStatus, SETTINGS.statusIntervalMs);
 
+    // Der Mitarbeiter-Roster wurde direkt zuvor vollständig geladen.
+    // Das Dashboard verwendet deshalb den frischen Cache und startet
+    // keinen zweiten Discord-Member-Fetch.
     await updateDashboardOverview().catch((error) => {
       console.warn(
         "⚠️ Dashboard konnte beim Start nicht aktualisiert werden:",
