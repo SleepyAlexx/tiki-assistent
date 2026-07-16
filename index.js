@@ -124,6 +124,13 @@ const EMPLOYEE_ROLE_IDS = [
   ROLES.probationEmployee,
 ];
 
+// Exakt wie beim aktuellen CaffeeContainer-Bot:
+// Nur Mitarbeiter und Probe-Mitarbeiter zählen in den Zeitlisten.
+const COUNTED_EMPLOYEE_ROLE_IDS = [
+  ROLES.employee,
+  ROLES.probationEmployee,
+];
+
 const TEAM_ROLE_IDS = [
   ...MANAGEMENT_ROLE_IDS,
   ...EMPLOYEE_ROLE_IDS,
@@ -294,6 +301,10 @@ function canManage(member) {
 
 function isEmployee(member) {
   return hasAnyRole(member, EMPLOYEE_ROLE_IDS);
+}
+
+function isCountedEmployeeMember(member) {
+  return hasAnyRole(member, COUNTED_EMPLOYEE_ROLE_IDS);
 }
 
 function hasManagerPosition(member) {
@@ -902,6 +913,28 @@ async function initDatabase() {
   `);
 
   await query(`
+    CREATE TABLE IF NOT EXISTS foodbusiness_name_mappings (
+      normalized_name TEXT PRIMARY KEY,
+      original_name TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS foodbusiness_pending_logs (
+      message_id TEXT PRIMARY KEY,
+      ic_name TEXT NOT NULL,
+      normalized_name TEXT NOT NULL,
+      minutes INTEGER NOT NULL,
+      original_text TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await query(`
     CREATE TABLE IF NOT EXISTS foodbusiness_money_logs (
       message_id TEXT PRIMARY KEY,
       amount NUMERIC,
@@ -1415,51 +1448,21 @@ function getRateLimitRetryMs(error, fallbackMs = 5_000) {
   return fallbackMs;
 }
 
-function countTrackedRoles(members) {
-  let employee = 0;
-  let probationEmployee = 0;
+async function fetchGuildMembersOnce(maxAttempts = 3) {
+  const guild =
+    client.guilds.cache.get(GUILD_ID) ||
+    (await client.guilds.fetch(GUILD_ID));
 
-  for (const member of members.values()) {
-    if (member.user.bot) continue;
-
-    if (member.roles.cache.has(ROLES.employee)) {
-      employee += 1;
-    }
-
-    if (
-      member.roles.cache.has(
-        ROLES.probationEmployee
-      )
-    ) {
-      probationEmployee += 1;
-    }
-  }
-
-  return {
-    employee,
-    probationEmployee,
-  };
-}
-
-async function listGuildMemberPageWithRetry({
-  guild,
-  after,
-  maxAttempts,
-  pageNumber,
-}) {
   let lastError = null;
 
-  for (
-    let attempt = 1;
-    attempt <= maxAttempts;
-    attempt += 1
-  ) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return await guild.members.list({
-        limit: 1_000,
-        after,
-        cache: true,
-      });
+      const members = await guild.members.fetch();
+
+      return {
+        guild,
+        members,
+      };
     } catch (error) {
       lastError = error;
 
@@ -1471,7 +1474,7 @@ async function listGuildMemberPageWithRetry({
         getRateLimitRetryMs(error) + 1_000;
 
       console.warn(
-        `⚠️ Mitgliederseite ${pageNumber} konnte nicht geladen werden ` +
+        `⚠️ Mitarbeiter konnten nicht geladen werden ` +
           `(Versuch ${attempt}/${maxAttempts}). ` +
           `Neuer Versuch in ${Math.ceil(waitMs / 1_000)} Sekunden.`
       );
@@ -1482,73 +1485,8 @@ async function listGuildMemberPageWithRetry({
 
   throw (
     lastError ||
-    new Error(
-      `Mitgliederseite ${pageNumber} konnte nicht geladen werden.`
-    )
+    new Error("Die Servermitglieder konnten nicht geladen werden.")
   );
-}
-
-async function fetchAllGuildMembersWithRetry(
-  maxAttempts = 3
-) {
-  const guild =
-    client.guilds.cache.get(GUILD_ID) ||
-    (await client.guilds.fetch(GUILD_ID));
-
-  const members = new Map();
-  let after;
-  let pageNumber = 1;
-
-  // guild.members.list() lädt über den REST-Endpunkt jeweils bis zu
-  // 1000 Mitglieder. Durch Pagination wird die Serverliste vollständig
-  // geladen, ohne den Gateway-Opcode-8-Fetch mehrfach auszulösen.
-  while (true) {
-    const page =
-      await listGuildMemberPageWithRetry({
-        guild,
-        after,
-        maxAttempts,
-        pageNumber,
-      });
-
-    for (const [userId, member] of page) {
-      members.set(userId, member);
-    }
-
-    if (page.size < 1_000) {
-      break;
-    }
-
-    const pageIds = [...page.keys()];
-    const nextAfter =
-      pageIds[pageIds.length - 1];
-
-    if (!nextAfter || nextAfter === after) {
-      throw new Error(
-        "Die Mitglieder-Pagination konnte nicht fortgesetzt werden."
-      );
-    }
-
-    after = nextAfter;
-    pageNumber += 1;
-
-    const reasonableMaximumPages =
-      Math.ceil(
-        Math.max(guild.memberCount, members.size) / 1_000
-      ) + 5;
-
-    if (pageNumber > reasonableMaximumPages) {
-      throw new Error(
-        "Die Mitglieder-Pagination wurde aus Sicherheitsgründen beendet."
-      );
-    }
-  }
-
-  return {
-    guild,
-    members,
-    actualCounts: countTrackedRoles(members),
-  };
 }
 
 async function persistEmployeeRoster(employeeIds) {
@@ -1592,6 +1530,16 @@ async function persistEmployeeRoster(employeeIds) {
         `,
         [uniqueIds]
       );
+
+      await databaseClient.query(
+        `
+          DELETE FROM active_sessions
+          WHERE NOT (
+            user_id = ANY($1::text[])
+          );
+        `,
+        [uniqueIds]
+      );
     } else {
       await databaseClient.query(
         `
@@ -1601,6 +1549,10 @@ async function persistEmployeeRoster(employeeIds) {
             updated_at = NOW();
         `
       );
+
+      await databaseClient.query(
+        `DELETE FROM active_sessions;`
+      );
     }
   });
 
@@ -1608,23 +1560,18 @@ async function persistEmployeeRoster(employeeIds) {
 }
 
 async function performEmployeeRosterRefresh(
-  maxAttempts
+  maxAttempts = 3
 ) {
   try {
-    const {
-      members,
-      actualCounts,
-    } =
-      await fetchAllGuildMembersWithRetry(
-        maxAttempts
-      );
+    const { members } =
+      await fetchGuildMembersOnce(maxAttempts);
 
     const employeeIds = [];
 
     for (const member of members.values()) {
       if (
         member.user.bot ||
-        !isEmployee(member)
+        !isCountedEmployeeMember(member)
       ) {
         continue;
       }
@@ -1633,34 +1580,28 @@ async function performEmployeeRosterRefresh(
     }
 
     const persistedIds =
-      await persistEmployeeRoster(
-        employeeIds
-      );
+      await persistEmployeeRoster(employeeIds);
 
     employeeRosterCache.userIds =
       new Set(persistedIds);
     employeeRosterCache.lastRefreshAt =
       Date.now();
     employeeRosterCache.lastSource =
-      "Discord-REST-Mitgliederliste";
+      "Discord-Rollenabgleich wie beim CC-Bot";
 
     console.log(
-      `✅ Mitarbeiter-Roster: ` +
-        `${persistedIds.length} eindeutig erkannt ` +
-        `(Mitarbeiterrolle: ${actualCounts.employee}, ` +
-        `Probe-Mitarbeiterrolle: ` +
-        `${actualCounts.probationEmployee}).`
+      `✅ Mitarbeiter-Rollen wurden synchronisiert: ` +
+        `${persistedIds.length} erkannt.`
     );
 
     return {
       userIds: new Set(persistedIds),
       count: persistedIds.length,
-      source:
-        employeeRosterCache.lastSource,
+      source: employeeRosterCache.lastSource,
     };
   } catch (error) {
     console.error(
-      "❌ Vollständiger Mitarbeiter-Sync fehlgeschlagen:",
+      "❌ Mitarbeiter-Rollen-Sync fehlgeschlagen:",
       error
     );
 
@@ -1674,23 +1615,18 @@ async function performEmployeeRosterRefresh(
     );
 
     const fallbackIds = new Set(
-      fallback.rows.map(
-        (row) => row.user_id
-      )
+      fallback.rows.map((row) => row.user_id)
     );
 
-    employeeRosterCache.userIds =
-      fallbackIds;
-    employeeRosterCache.lastRefreshAt =
-      Date.now();
+    employeeRosterCache.userIds = fallbackIds;
+    employeeRosterCache.lastRefreshAt = Date.now();
     employeeRosterCache.lastSource =
       "Datenbank-Fallback nach Sync-Fehler";
 
     return {
       userIds: new Set(fallbackIds),
       count: fallbackIds.size,
-      source:
-        employeeRosterCache.lastSource,
+      source: employeeRosterCache.lastSource,
     };
   }
 }
@@ -1700,23 +1636,17 @@ async function refreshEmployeeRoster({
   maxAttempts = 3,
 } = {}) {
   const cacheAge =
-    Date.now() -
-    employeeRosterCache.lastRefreshAt;
+    Date.now() - employeeRosterCache.lastRefreshAt;
 
   if (
     !force &&
     employeeRosterCache.lastRefreshAt > 0 &&
-    cacheAge <
-      EMPLOYEE_ROSTER_CACHE_TTL_MS
+    cacheAge < EMPLOYEE_ROSTER_CACHE_TTL_MS
   ) {
     return {
-      userIds: new Set(
-        employeeRosterCache.userIds
-      ),
-      count:
-        employeeRosterCache.userIds.size,
-      source:
-        employeeRosterCache.lastSource,
+      userIds: new Set(employeeRosterCache.userIds),
+      count: employeeRosterCache.userIds.size,
+      source: employeeRosterCache.lastSource,
     };
   }
 
@@ -1725,9 +1655,7 @@ async function refreshEmployeeRoster({
   }
 
   employeeRosterRefreshPromise =
-    performEmployeeRosterRefresh(
-      maxAttempts
-    );
+    performEmployeeRosterRefresh(maxAttempts);
 
   try {
     return await employeeRosterRefreshPromise;
@@ -1779,64 +1707,40 @@ async function getTrackedDashboardMembers() {
 }
 
 async function getDashboardTimeSnapshot() {
-  const {
-    trackedMembers,
-    trackedUserIds,
-  } = await getTrackedDashboardMembers();
+  // Exakt wie beim CC-Bot werden die Zeitlisten direkt aus der
+  // stabilen employees-Tabelle gelesen. Der Rollen-Sync setzt
+  // left_server nur für echte Mitarbeiter/Probe-Mitarbeiter auf FALSE.
+  const timeResult = await query(
+    `
+      SELECT user_id, weekly_minutes, total_minutes
+      FROM employees
+      WHERE left_server = FALSE
+      ORDER BY user_id ASC
+    `
+  );
 
-  if (trackedUserIds.length === 0) {
-    return {
-      trackedMembers,
-      trackedUserIds,
-      rows: [],
-      activeUserIds: new Set(),
-    };
-  }
-
-  const [timeResult, activeResult] = await Promise.all([
-    query(
-      `
-        SELECT user_id, weekly_minutes, total_minutes
-        FROM employees
-        WHERE user_id = ANY($1::text[])
-      `,
-      [trackedUserIds]
-    ),
-    query(
-      `
-        SELECT user_id
-        FROM active_sessions
-        WHERE user_id = ANY($1::text[])
-      `,
-      [trackedUserIds]
-    ),
-  ]);
-
-  const timeByUser = new Map(
-    timeResult.rows.map((row) => [
-      row.user_id,
-      {
-        weeklyMinutes: Number(row.weekly_minutes) || 0,
-        totalMinutes: Number(row.total_minutes) || 0,
-      },
-    ])
+  const activeResult = await query(
+    `
+      SELECT user_id
+      FROM active_sessions
+    `
   );
 
   const activeUserIds = new Set(
     activeResult.rows.map((row) => row.user_id)
   );
 
-  const rows = trackedUserIds.map((userId) => ({
-    userId,
+  const rows = timeResult.rows.map((row) => ({
+    userId: row.user_id,
     weeklyMinutes:
-      timeByUser.get(userId)?.weeklyMinutes || 0,
+      Number(row.weekly_minutes) || 0,
     totalMinutes:
-      timeByUser.get(userId)?.totalMinutes || 0,
+      Number(row.total_minutes) || 0,
   }));
 
   return {
-    trackedMembers,
-    trackedUserIds,
+    trackedMembers: null,
+    trackedUserIds: rows.map((row) => row.userId),
     rows,
     activeUserIds,
   };
@@ -3833,51 +3737,86 @@ function extractFoodbusinessDurationMinutes(text) {
   return Math.max(1, Math.ceil(totalSeconds / 60));
 }
 
-function findExactMemberMatches(guild, icName) {
-  const normalizedTarget = normalizeName(icName);
+function normalizeFoodBusinessName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  return guild.members.cache.filter((member) => {
-    if (member.user.bot) return false;
-
-    const possibleNames = [
-      member.displayName,
-      member.nickname,
-      member.user.globalName,
-      member.user.username,
-    ]
-      .filter(Boolean)
-      .map(normalizeName);
-
-    return possibleNames.includes(normalizedTarget);
-  });
+function stripDiscordPrefix(name) {
+  return String(name || "")
+    .replace(/^[A-ZÄÖÜ]{1,8}\s*\|\s*/i, "")
+    .replace(/^TIKI\s*[-|]\s*/i, "")
+    .trim();
 }
 
 async function findMemberByIcName(guild, icName) {
-  let exactMatches =
-    findExactMemberMatches(guild, icName);
+  const normalized =
+    normalizeFoodBusinessName(icName);
 
-  if (exactMatches.size === 0) {
-    await guild.members.fetch().catch((error) => {
-      console.warn(
-        "⚠️ Mitglieder konnten für die Namenszuordnung nicht vollständig geladen werden:",
-        error.message
-      );
-    });
+  const mapped = await query(
+    `
+      SELECT user_id
+      FROM foodbusiness_name_mappings
+      WHERE normalized_name = $1
+    `,
+    [normalized]
+  ).catch(() => ({ rows: [] }));
 
-    exactMatches =
-      findExactMemberMatches(guild, icName);
+  if (mapped.rows[0]?.user_id) {
+    const mappedMember = await guild.members
+      .fetch(mapped.rows[0].user_id)
+      .catch(() => null);
+
+    if (mappedMember) {
+      return mappedMember;
+    }
   }
 
-  if (exactMatches.size === 1) {
-    return exactMatches.first();
+  const members = await guild.members.fetch();
+  const matches = [];
+
+  for (const member of members.values()) {
+    if (member.user.bot) continue;
+
+    const display =
+      member.nickname ||
+      member.user.globalName ||
+      member.user.username;
+
+    const cleanDisplay =
+      stripDiscordPrefix(display);
+
+    const normalizedDisplay =
+      normalizeFoodBusinessName(cleanDisplay);
+
+    const normalizedFull =
+      normalizeFoodBusinessName(display);
+
+    if (
+      normalizedDisplay === normalized ||
+      normalizedFull === normalized ||
+      normalizedFull.includes(normalized) ||
+      normalized.includes(normalizedDisplay)
+    ) {
+      matches.push(member);
+    }
   }
 
-  if (exactMatches.size > 1) {
+  if (matches.length === 1) {
+    return matches[0];
+  }
+
+  if (matches.length > 1) {
     const employeeMatches =
-      exactMatches.filter(isEmployee);
+      matches.filter(isCountedEmployeeMember);
 
-    if (employeeMatches.size === 1) {
-      return employeeMatches.first();
+    if (employeeMatches.length === 1) {
+      return employeeMatches[0];
     }
   }
 
@@ -4046,6 +3985,29 @@ async function handleFoodbusinessClockIn({
   });
 
   await query(
+    `
+      INSERT INTO foodbusiness_name_mappings (
+        normalized_name,
+        original_name,
+        user_id,
+        created_by,
+        updated_at
+      )
+      VALUES ($1, $2, $3, 'System', NOW())
+      ON CONFLICT (normalized_name)
+      DO UPDATE SET
+        original_name = EXCLUDED.original_name,
+        user_id = EXCLUDED.user_id,
+        updated_at = NOW();
+    `,
+    [
+      normalizeFoodBusinessName(icName),
+      icName,
+      member.id,
+    ]
+  ).catch(() => null);
+
+  await query(
     `DELETE FROM stale_duty_alerts WHERE user_id = $1`,
     [member.id]
   );
@@ -4077,6 +4039,13 @@ async function handleFoodbusinessClockOut({
   durationMinutes,
   originalText,
 }) {
+  const minutes = Math.max(
+    1,
+    Number(durationMinutes) || 1
+  );
+
+  await ensureEmployee(member.id);
+
   const sessionResult = await query(
     `
       SELECT started_at
@@ -4090,83 +4059,178 @@ async function handleFoodbusinessClockOut({
     sessionResult.rows[0]?.started_at ||
     new Date(
       message.createdAt.getTime() -
-        Math.max(1, durationMinutes || 1) * 60 * 1000
+        minutes * 60 * 1000
     );
 
-  const calculatedMinutes = Math.max(
-    1,
-    Math.ceil(
-      (message.createdAt.getTime() -
-        new Date(startedAt).getTime()) /
-        60000
-    )
-  );
-
-  const minutes = durationMinutes || calculatedMinutes;
-
-  const bookingTotals = await withTransaction(
+  const bookingResult = await withTransaction(
     async (databaseClient) => {
-      await databaseClient.query(
-        `
-        INSERT INTO work_sessions (
-          user_id,
-          ic_name,
-          started_at,
-          ended_at,
-          minutes,
-          corrected,
-          source_message_id
-        )
-        VALUES ($1, $2, $3, $4, $5, FALSE, $6);
-      `,
-      [
-        member.id,
-        icName,
-        startedAt,
-        message.createdAt,
-        minutes,
-        message.id,
-      ]
-    );
-
-      const totals =
-        await creditEmployeeMinutes(
-          databaseClient,
-          member.id,
-          minutes
+      const processedInsert =
+        await databaseClient.query(
+          `
+            INSERT INTO foodbusiness_processed_logs (
+              message_id,
+              user_id,
+              ic_name,
+              action,
+              minutes,
+              processing_status,
+              original_text
+            )
+            VALUES (
+              $1,
+              $2,
+              $3,
+              'clock_out',
+              $4,
+              'assigned',
+              $5
+            )
+            ON CONFLICT (message_id)
+            DO NOTHING
+            RETURNING message_id;
+          `,
+          [
+            message.id,
+            member.id,
+            icName,
+            minutes,
+            originalText,
+          ]
         );
 
+      if (processedInsert.rowCount === 0) {
+        const currentTotals =
+          await databaseClient.query(
+            `
+              SELECT
+                weekly_minutes,
+                total_minutes
+              FROM employees
+              WHERE user_id = $1
+            `,
+            [member.id]
+          );
+
+        return {
+          alreadyProcessed: true,
+          weeklyMinutes:
+            Number(
+              currentTotals.rows[0]?.weekly_minutes
+            ) || 0,
+          totalMinutes:
+            Number(
+              currentTotals.rows[0]?.total_minutes
+            ) || 0,
+        };
+      }
+
       await databaseClient.query(
-        `DELETE FROM active_sessions WHERE user_id = $1`,
+        `
+          INSERT INTO work_sessions (
+            user_id,
+            ic_name,
+            started_at,
+            ended_at,
+            minutes,
+            corrected,
+            source_message_id
+          )
+          VALUES (
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            FALSE,
+            $6
+          )
+          ON CONFLICT DO NOTHING;
+        `,
+        [
+          member.id,
+          icName,
+          startedAt,
+          message.createdAt,
+          minutes,
+          message.id,
+        ]
+      );
+
+      const totals =
+        await databaseClient.query(
+          `
+            UPDATE employees
+            SET
+              total_minutes =
+                total_minutes + $2,
+              weekly_minutes =
+                weekly_minutes + $2,
+              left_server = FALSE,
+              updated_at = NOW()
+            WHERE user_id = $1
+            RETURNING
+              weekly_minutes,
+              total_minutes;
+          `,
+          [member.id, minutes]
+        );
+
+      if (totals.rowCount !== 1) {
+        throw new Error(
+          `Arbeitszeit konnte für ${member.id} nicht gebucht werden.`
+        );
+      }
+
+      await databaseClient.query(
+        `
+          DELETE FROM active_sessions
+          WHERE user_id = $1
+        `,
         [member.id]
       );
 
       await databaseClient.query(
         `
-          INSERT INTO foodbusiness_processed_logs (
-            message_id,
+          INSERT INTO foodbusiness_name_mappings (
+            normalized_name,
+            original_name,
             user_id,
-            ic_name,
-            action,
-            minutes,
-            processing_status,
-            original_text
+            created_by,
+            updated_at
           )
-          VALUES ($1, $2, $3, 'clock_out', $4, 'assigned', $5)
-          ON CONFLICT (message_id) DO NOTHING;
+          VALUES ($1, $2, $3, 'System', NOW())
+          ON CONFLICT (normalized_name)
+          DO UPDATE SET
+            original_name =
+              EXCLUDED.original_name,
+            user_id =
+              EXCLUDED.user_id,
+            updated_at = NOW();
         `,
         [
-          message.id,
-          member.id,
+          normalizeFoodBusinessName(icName),
           icName,
-          minutes,
-          originalText,
+          member.id,
         ]
       );
 
-      return totals;
+      return {
+        alreadyProcessed: false,
+        weeklyMinutes:
+          Number(
+            totals.rows[0].weekly_minutes
+          ) || 0,
+        totalMinutes:
+          Number(
+            totals.rows[0].total_minutes
+          ) || 0,
+      };
     }
   );
+
+  if (bookingResult.alreadyProcessed) {
+    return;
+  }
 
   await safeRemoveRoles(
     member,
@@ -4179,6 +4243,11 @@ async function handleFoodbusinessClockOut({
     [member.id]
   );
 
+  employeeRosterCache.userIds.add(member.id);
+  employeeRosterCache.lastRefreshAt = Date.now();
+  employeeRosterCache.lastSource =
+    "Foodbusiness-Zeitbuchung";
+
   const embed = createBaseEmbed(0xed4245)
     .setTitle("🔴 • FOODBUSINESS AUSGESTEMPELT")
     .setDescription(
@@ -4186,12 +4255,11 @@ async function handleFoodbusinessClockOut({
         `👤 **IC-Name**\n└ ${icName}\n\n` +
         `👥 **Discord-User**\n└ ${member}\n\n` +
         `⏱️ **Arbeitszeit**\n└ ${formatShortMinutes(minutes)}\n\n` +
-        `📥 **Gebucht**\n└ ${formatShortMinutes(minutes)} wurden übernommen.\n\n` +
-        `📊 **Wochenzeit**\n└ ${formatShortMinutes(
-          bookingTotals.weeklyMinutes
+        `📊 **Neue Wochenzeit**\n└ ${formatShortMinutes(
+          bookingResult.weeklyMinutes
         )}\n\n` +
-        `🏆 **Gesamtzeit**\n└ ${formatShortMinutes(
-          bookingTotals.totalMinutes
+        `🏆 **Neue Gesamtzeit**\n└ ${formatShortMinutes(
+          bookingResult.totalMinutes
         )}\n\n` +
         "🔴 **Aktion**\n" +
         "└ Im-Dienst-Rolle wurde entfernt.\n\n" +
@@ -4204,7 +4272,14 @@ async function handleFoodbusinessClockOut({
     });
 
   await sendEmbed(CHANNELS.dutyLogs, embed);
-  await updateTimeOverviewMessages().catch(() => null);
+  await updateTimeOverviewMessages().catch(
+    (error) => {
+      console.error(
+        "❌ Zeitlisten konnten nach dem Ausstempeln nicht aktualisiert werden:",
+        error
+      );
+    }
+  );
 }
 
 async function processFoodbusinessTimeMessage(message) {
@@ -5192,6 +5267,11 @@ async function handleChatInputCommand(interaction) {
     }
 
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    await refreshEmployeeRoster({
+      force: true,
+      maxAttempts: 3,
+    });
 
     const type =
       interaction.commandName === "wochenzeiten"
