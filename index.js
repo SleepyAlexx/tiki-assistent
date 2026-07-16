@@ -596,6 +596,55 @@ async function ensureEmployee(userId) {
   );
 }
 
+async function creditEmployeeMinutes(
+  databaseClient,
+  userId,
+  minutes
+) {
+  const safeMinutes = Math.max(
+    1,
+    Math.round(Number(minutes) || 0)
+  );
+
+  const result = await databaseClient.query(
+    `
+      INSERT INTO employees (
+        user_id,
+        total_minutes,
+        weekly_minutes,
+        left_server,
+        updated_at
+      )
+      VALUES ($1, $2, $2, FALSE, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        weekly_minutes =
+          employees.weekly_minutes +
+          EXCLUDED.weekly_minutes,
+        total_minutes =
+          employees.total_minutes +
+          EXCLUDED.total_minutes,
+        left_server = FALSE,
+        updated_at = NOW()
+      RETURNING weekly_minutes, total_minutes;
+    `,
+    [userId, safeMinutes]
+  );
+
+  if (result.rowCount !== 1) {
+    throw new Error(
+      `Arbeitszeit konnte für ${userId} nicht gebucht werden.`
+    );
+  }
+
+  return {
+    weeklyMinutes:
+      Number(result.rows[0].weekly_minutes) || 0,
+    totalMinutes:
+      Number(result.rows[0].total_minutes) || 0,
+  };
+}
+
 async function sendOrUpdatePermanentMessage(
   channelId,
   settingKey,
@@ -690,6 +739,21 @@ async function initDatabase() {
       source_message_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  await query(`
+    DELETE FROM work_sessions older
+    USING work_sessions newer
+    WHERE older.source_message_id IS NOT NULL
+      AND older.source_message_id = newer.source_message_id
+      AND older.id > newer.id;
+  `);
+
+  await query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS
+      work_sessions_source_message_unique
+    ON work_sessions (source_message_id)
+    WHERE source_message_id IS NOT NULL;
   `);
 
   await query(`
@@ -884,6 +948,20 @@ async function registerCommands() {
       .setName("mitarbeiter-sync")
       .setDescription(
         "Lädt Mitarbeiter- und Probe-Mitarbeiterrollen vollständig neu."
+      ),
+
+    new SlashCommandBuilder()
+      .setName("arbeitszeiten-reparieren")
+      .setDescription(
+        "Übernimmt fehlende gespeicherte Dienste in Wochen- und Gesamtzeit."
+      )
+      .addUserOption((option) =>
+        option
+          .setName("user")
+          .setDescription(
+            "Optional nur einen bestimmten Mitarbeiter reparieren"
+          )
+          .setRequired(false)
       ),
 
     new SlashCommandBuilder()
@@ -1693,6 +1771,29 @@ async function buildLeaderboardPayload(type, requestedPage = 0) {
   };
 }
 
+function leaderboardSettingKeys(type) {
+  const prefix =
+    type === "weekly"
+      ? "weekly_leaderboard"
+      : "total_leaderboard";
+
+  return {
+    channelKey: `${prefix}_channel_id`,
+    messageKey: `${prefix}_message_id`,
+  };
+}
+
+function getLeaderboardPageFromMessage(message) {
+  const customId =
+    message?.components?.[0]?.components?.[0]?.customId;
+
+  const match = String(customId || "").match(
+    /^leaderboard:(?:weekly|total):(?:prev|next):(\d+)$/
+  );
+
+  return match ? Number(match[1]) || 0 : 0;
+}
+
 async function sendLeaderboardToChannel(type, channel) {
   if (
     !channel?.isTextBased?.() ||
@@ -1703,8 +1804,90 @@ async function sendLeaderboardToChannel(type, channel) {
     );
   }
 
-  const result = await buildLeaderboardPayload(type, 0);
-  return channel.send(result.payload);
+  const { channelKey, messageKey } =
+    leaderboardSettingKeys(type);
+
+  const oldChannelId = await getSetting(channelKey);
+  const oldMessageId = await getSetting(messageKey);
+
+  let message = null;
+  let currentPage = 0;
+
+  if (
+    oldChannelId === channel.id &&
+    oldMessageId
+  ) {
+    message = await channel.messages
+      .fetch(oldMessageId)
+      .catch(() => null);
+
+    currentPage = getLeaderboardPageFromMessage(message);
+  }
+
+  const result = await buildLeaderboardPayload(
+    type,
+    currentPage
+  );
+
+  if (message) {
+    await message.edit(result.payload);
+  } else {
+    message = await channel.send(result.payload);
+  }
+
+  await setSetting(channelKey, channel.id);
+  await setSetting(messageKey, message.id);
+
+  return message;
+}
+
+async function updateConfiguredLeaderboard(type) {
+  const { channelKey, messageKey } =
+    leaderboardSettingKeys(type);
+
+  const channelId = await getSetting(channelKey);
+  const messageId = await getSetting(messageKey);
+
+  if (!channelId || !messageId) {
+    return null;
+  }
+
+  const channel = await fetchTextChannel(channelId);
+
+  if (!channel || !channel.messages) {
+    return null;
+  }
+
+  const message = await channel.messages
+    .fetch(messageId)
+    .catch(() => null);
+
+  if (!message) {
+    return null;
+  }
+
+  const page = getLeaderboardPageFromMessage(message);
+  const result = await buildLeaderboardPayload(type, page);
+
+  await message.edit(result.payload);
+  return message;
+}
+
+async function updateTimeOverviewMessages() {
+  const results = await Promise.allSettled([
+    updateDashboardMessage(),
+    updateConfiguredLeaderboard("weekly"),
+    updateConfiguredLeaderboard("total"),
+  ]);
+
+  for (const result of results) {
+    if (result.status === "rejected") {
+      console.error(
+        "❌ Eine Arbeitszeitübersicht konnte nicht aktualisiert werden:",
+        result.reason
+      );
+    }
+  }
 }
 
 async function buildDashboardEmbed() {
@@ -1890,10 +2073,91 @@ async function updateDashboardMessage() {
 }
 
 async function updateDashboardOverview() {
-  // Das feste Dashboard bleibt im konfigurierten Dashboard-Kanal.
-  // Wochen- und Gesamtzeiten werden bewusst nur noch per Slash-Command
-  // in den jeweils gewünschten Kanal gesendet.
-  await updateDashboardMessage();
+  await updateTimeOverviewMessages();
+}
+
+function getCurrentWeekStartDateTime() {
+  const {
+    year,
+    month,
+    day,
+  } = getCurrentDatePartsInTimeZone();
+
+  const calendarDate =
+    new Date(Date.UTC(year, month - 1, day));
+
+  const daysSinceMonday =
+    (calendarDate.getUTCDay() + 6) % 7;
+
+  calendarDate.setUTCDate(
+    calendarDate.getUTCDate() - daysSinceMonday
+  );
+
+  return createDateInTimeZone({
+    year: calendarDate.getUTCFullYear(),
+    month: calendarDate.getUTCMonth() + 1,
+    day: calendarDate.getUTCDate(),
+    hour: 0,
+    minute: 0,
+  });
+}
+
+async function repairEmployeeTimesFromSessions(
+  targetUserId = null
+) {
+  const weekStart = getCurrentWeekStartDateTime();
+
+  const result = await query(
+    `
+      WITH session_sums AS (
+        SELECT
+          user_id,
+          COALESCE(SUM(minutes), 0)::int
+            AS calculated_total,
+          COALESCE(
+            SUM(minutes) FILTER (
+              WHERE ended_at >= $1
+            ),
+            0
+          )::int AS calculated_weekly
+        FROM work_sessions
+        WHERE ($2::text IS NULL OR user_id = $2)
+        GROUP BY user_id
+      )
+      INSERT INTO employees (
+        user_id,
+        total_minutes,
+        weekly_minutes,
+        left_server,
+        updated_at
+      )
+      SELECT
+        user_id,
+        calculated_total,
+        calculated_weekly,
+        FALSE,
+        NOW()
+      FROM session_sums
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        total_minutes = GREATEST(
+          employees.total_minutes,
+          EXCLUDED.total_minutes
+        ),
+        weekly_minutes = GREATEST(
+          employees.weekly_minutes,
+          EXCLUDED.weekly_minutes
+        ),
+        updated_at = NOW()
+      RETURNING
+        user_id,
+        weekly_minutes,
+        total_minutes;
+    `,
+    [weekStart, targetUserId]
+  );
+
+  return result.rows;
 }
 
 // ============================================================
@@ -3214,7 +3478,7 @@ async function applyTimeAdjustment({
     };
   });
 
-  await updateDashboardMessage().catch(() => null);
+  await updateTimeOverviewMessages().catch(() => null);
 
   const actionLabels = {
     add: "Zeit hinzugefügt",
@@ -3295,16 +3559,49 @@ function extractFoodbusinessName(text) {
 }
 
 function extractFoodbusinessDurationMinutes(text) {
-  const match = text.match(
-    /Dauer:\s*(\d+)\s*Stunden?,\s*(\d+)\s*Minuten?,\s*([\d.,]+)\s*Sekunden?/i
+  const cleanText = String(text || "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ");
+
+  const fullMatch = cleanText.match(
+    /Dauer:\s*(\d+)\s*(?:Stunden?|Std\.?)[,\s]+(\d+)\s*(?:Minuten?|Min\.?)[,\s]+([\d.,]+)\s*(?:Sekunden?|Sek\.?)/i
   );
 
-  if (!match) return null;
+  if (fullMatch) {
+    const hours = Number(fullMatch[1]);
+    const minutes = Number(fullMatch[2]);
+    const seconds = Number(
+      String(fullMatch[3]).replace(",", ".")
+    );
 
-  const hours = Number(match[1]);
-  const minutes = Number(match[2]);
-  const seconds = Number(String(match[3]).replace(",", "."));
-  const totalSeconds = hours * 3600 + minutes * 60 + seconds;
+    const totalSeconds =
+      hours * 3600 + minutes * 60 + seconds;
+
+    return Math.max(1, Math.ceil(totalSeconds / 60));
+  }
+
+  const hoursMatch = cleanText.match(
+    /(\d+)\s*(?:Stunden?|Std\.?)/i
+  );
+  const minutesMatch = cleanText.match(
+    /(\d+)\s*(?:Minuten?|Min\.?)/i
+  );
+  const secondsMatch = cleanText.match(
+    /([\d.,]+)\s*(?:Sekunden?|Sek\.?)/i
+  );
+
+  if (!hoursMatch && !minutesMatch && !secondsMatch) {
+    return null;
+  }
+
+  const hours = Number(hoursMatch?.[1] || 0);
+  const minutes = Number(minutesMatch?.[1] || 0);
+  const seconds = Number(
+    String(secondsMatch?.[1] || 0).replace(",", ".")
+  );
+
+  const totalSeconds =
+    hours * 3600 + minutes * 60 + seconds;
 
   return Math.max(1, Math.ceil(totalSeconds / 60));
 }
@@ -3471,7 +3768,7 @@ async function handleFoodbusinessClockIn({
     });
 
   await sendEmbed(CHANNELS.dutyLogs, embed);
-  await updateDashboardMessage().catch(() => null);
+  await updateTimeOverviewMessages().catch(() => null);
 }
 
 async function handleFoodbusinessClockOut({
@@ -3534,17 +3831,10 @@ async function handleFoodbusinessClockOut({
       ]
     );
 
-    await databaseClient.query(
-      `
-        UPDATE employees
-        SET
-          weekly_minutes = weekly_minutes + $2,
-          total_minutes = total_minutes + $2,
-          left_server = FALSE,
-          updated_at = NOW()
-        WHERE user_id = $1;
-      `,
-      [member.id, minutes]
+    await creditEmployeeMinutes(
+      databaseClient,
+      member.id,
+      minutes
     );
 
     await databaseClient.query(
@@ -3599,7 +3889,7 @@ async function handleFoodbusinessClockOut({
     });
 
   await sendEmbed(CHANNELS.dutyLogs, embed);
-  await updateDashboardMessage().catch(() => null);
+  await updateTimeOverviewMessages().catch(() => null);
 }
 
 async function processFoodbusinessTimeMessage(message) {
@@ -3963,17 +4253,10 @@ async function bookDutyCorrection(interaction, token) {
       ]
     );
 
-    await databaseClient.query(
-      `
-        UPDATE employees
-        SET
-          weekly_minutes = weekly_minutes + $2,
-          total_minutes = total_minutes + $2,
-          left_server = FALSE,
-          updated_at = NOW()
-        WHERE user_id = $1;
-      `,
-      [draft.targetUserId, draft.minutes]
+    await creditEmployeeMinutes(
+      databaseClient,
+      draft.targetUserId,
+      draft.minutes
     );
 
     await databaseClient.query(
@@ -4018,7 +4301,7 @@ async function bookDutyCorrection(interaction, token) {
   }
 
   dutyCorrectionDrafts.delete(token);
-  await updateDashboardMessage().catch(() => null);
+  await updateTimeOverviewMessages().catch(() => null);
 
   const logEmbed = createBaseEmbed(0x57f287)
     .setTitle("🔧 • DIENSTZEIT KORRIGIERT")
@@ -4276,6 +4559,8 @@ async function handleChatInputCommand(interaction) {
           "└ Zeitübersichten im aktuellen oder ausgewählten Kanal senden\n\n" +
           "🔄 `/mitarbeiter-sync`\n" +
           "└ Mitarbeiterrollen vollständig neu einlesen\n\n" +
+          "🧰 `/arbeitszeiten-reparieren`\n" +
+          "└ Fehlende alte Zeitbuchungen aus gespeicherten Diensten übernehmen\n\n" +
           "🔧 `/dienst-korrektur`\n" +
           "└ Aktiven Dienst nach Crash korrekt abschließen\n\n" +
           "📁 `/akte`, `/personalnotiz`, `/mitarbeitercheck`\n" +
@@ -4295,6 +4580,7 @@ async function handleChatInputCommand(interaction) {
     "registrierungspanel",
     "dashboard",
     "mitarbeiter-sync",
+    "arbeitszeiten-reparieren",
     "wochenzeiten",
     "gesamtzeiten",
     "akte",
@@ -4372,6 +4658,41 @@ async function handleChatInputCommand(interaction) {
       `✅ **${roster.count} Mitarbeiter** wurden anhand der ` +
         `Mitarbeiter- und Probe-Mitarbeiterrolle erkannt.\n` +
         `Quelle: **${roster.source}**`
+    );
+  }
+
+  if (
+    interaction.commandName ===
+    "arbeitszeiten-reparieren"
+  ) {
+    const target =
+      interaction.options.getUser("user");
+
+    await interaction.deferReply({
+      ephemeral: true,
+    });
+
+    const repairedRows =
+      await repairEmployeeTimesFromSessions(
+        target?.id || null
+      );
+
+    await updateTimeOverviewMessages();
+
+    if (target && repairedRows.length === 0) {
+      return interaction.editReply(
+        `ℹ️ Für ${target} wurden noch keine gespeicherten ` +
+          "Arbeitssitzungen gefunden."
+      );
+    }
+
+    return interaction.editReply(
+      target
+        ? `✅ Die gespeicherten Arbeitszeiten von ${target} ` +
+            "wurden mit Wochen- und Gesamtzeit abgeglichen."
+        : `✅ Die Arbeitszeiten von **${repairedRows.length} ` +
+            "Mitarbeitern** wurden mit den gespeicherten " +
+            "Diensten abgeglichen."
     );
   }
 
