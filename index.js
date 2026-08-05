@@ -1707,12 +1707,16 @@ async function getTrackedDashboardMembers() {
 }
 
 async function getDashboardTimeSnapshot() {
-  // Exakt wie beim CC-Bot werden die Zeitlisten direkt aus der
-  // stabilen employees-Tabelle gelesen. Der Rollen-Sync setzt
-  // left_server nur für echte Mitarbeiter/Probe-Mitarbeiter auf FALSE.
+  // Vor jeder Zeitübersicht werden fehlende Foodbusiness-Buchungen
+  // aus work_sessions/processed_logs in Weekly und Gesamt übernommen.
+  await repairEmployeeTimesFromSessions();
+
   const timeResult = await query(
     `
-      SELECT user_id, weekly_minutes, total_minutes
+      SELECT
+        user_id,
+        weekly_minutes,
+        total_minutes
       FROM employees
       WHERE left_server = FALSE
       ORDER BY user_id ASC
@@ -1940,46 +1944,76 @@ async function updateConfiguredLeaderboard(type) {
   const channelId = await getSetting(channelKey);
   const messageId = await getSetting(messageKey);
 
-  if (!channelId || !messageId) {
+  if (!channelId) {
     return null;
   }
 
   const channel = await fetchTextChannel(channelId);
 
-  if (!channel || !channel.messages) {
-    return null;
+  if (
+    !channel ||
+    !channel.messages ||
+    typeof channel.send !== "function"
+  ) {
+    throw new Error(
+      `Der gespeicherte ${type}-Kanal ${channelId} ist nicht erreichbar.`
+    );
   }
 
-  const message = await channel.messages
-    .fetch(messageId)
-    .catch(() => null);
+  let message = null;
 
-  if (!message) {
-    return null;
+  if (messageId) {
+    message = await channel.messages
+      .fetch(messageId)
+      .catch(() => null);
   }
 
   const page = getLeaderboardPageFromMessage(message);
   const result = await buildLeaderboardPayload(type, page);
 
-  await message.edit(result.payload);
-  return message;
+  if (message) {
+    await message.edit(result.payload);
+    return message;
+  }
+
+  // Gelöschte oder alte Nachrichten werden automatisch neu erstellt.
+  const newMessage = await channel.send(result.payload);
+  await setSetting(messageKey, newMessage.id);
+
+  console.log(
+    `✅ ${type === "weekly" ? "Wochenzeiten" : "Gesamtzeiten"}-Nachricht wurde neu erstellt.`
+  );
+
+  return newMessage;
 }
 
-async function updateTimeOverviewMessages() {
-  const results = await Promise.allSettled([
-    updateDashboardMessage(),
-    updateConfiguredLeaderboard("weekly"),
-    updateConfiguredLeaderboard("total"),
-  ]);
+async function refreshAllTimeDisplays() {
+  const jobs = [
+    ["Dashboard", updateDashboardMessage],
+    [
+      "Wochenzeiten",
+      () => updateConfiguredLeaderboard("weekly"),
+    ],
+    [
+      "Gesamtzeiten",
+      () => updateConfiguredLeaderboard("total"),
+    ],
+  ];
 
-  for (const result of results) {
-    if (result.status === "rejected") {
+  for (const [label, task] of jobs) {
+    try {
+      await task();
+    } catch (error) {
       console.error(
-        "❌ Eine Arbeitszeitübersicht konnte nicht aktualisiert werden:",
-        result.reason
+        `❌ ${label} konnten nicht aktualisiert werden:`,
+        error
       );
     }
   }
+}
+
+async function updateTimeOverviewMessages() {
+  return refreshAllTimeDisplays();
 }
 
 async function buildDashboardEmbed() {
@@ -2194,14 +2228,61 @@ function getCurrentWeekStartDateTime() {
   });
 }
 
+function getCurrentWeekKey() {
+  return getCurrentWeekStartDateTime()
+    .toISOString()
+    .slice(0, 10);
+}
+
+async function ensureWeeklyReset() {
+  const currentWeekKey = getCurrentWeekKey();
+  const storedWeekKey = await getSetting(
+    "weekly_reset_week_key",
+    null
+  );
+
+  // Beim allerersten Start wird nur die aktuelle Woche gespeichert.
+  // Bereits in dieser Woche vorhandene Zeiten bleiben dadurch erhalten.
+  if (!storedWeekKey) {
+    await setSetting(
+      "weekly_reset_week_key",
+      currentWeekKey
+    );
+    return false;
+  }
+
+  if (storedWeekKey === currentWeekKey) {
+    return false;
+  }
+
+  await query(`
+    UPDATE employees
+    SET
+      weekly_minutes = 0,
+      updated_at = NOW();
+  `);
+
+  await setSetting(
+    "weekly_reset_week_key",
+    currentWeekKey
+  );
+
+  console.log(
+    `✅ Wochenzeiten wurden für die neue Woche ${currentWeekKey} zurückgesetzt.`
+  );
+
+  return true;
+}
+
 async function repairEmployeeTimesFromSessions(
   targetUserId = null
 ) {
+  await ensureWeeklyReset();
+
   const weekStart = getCurrentWeekStartDateTime();
 
-  // Ältere Bot-Versionen konnten eine Foodbusiness-Meldung
-  // bereits als verarbeitet markieren, ohne eine Work-Session
-  // anzulegen. Diese Einträge werden zuerst rekonstruiert.
+  // Ältere verarbeitete Foodbusiness-Logs werden als Work-Session
+  // rekonstruiert, falls damalige Bot-Versionen nur den Log speicherten.
   await query(
     `
       INSERT INTO work_sessions (
@@ -2252,38 +2333,30 @@ async function repairEmployeeTimesFromSessions(
             0
           )::int AS calculated_weekly
         FROM work_sessions
-        WHERE ($2::text IS NULL OR user_id = $2)
+        WHERE (
+          $2::text IS NULL OR
+          user_id = $2
+        )
         GROUP BY user_id
       )
-      INSERT INTO employees (
-        user_id,
-        total_minutes,
-        weekly_minutes,
-        left_server,
-        updated_at
-      )
-      SELECT
-        user_id,
-        calculated_total,
-        calculated_weekly,
-        FALSE,
-        NOW()
-      FROM session_sums
-      ON CONFLICT (user_id)
-      DO UPDATE SET
+      UPDATE employees employee
+      SET
         total_minutes = GREATEST(
-          employees.total_minutes,
-          EXCLUDED.total_minutes
+          employee.total_minutes,
+          session_sums.calculated_total
         ),
         weekly_minutes = GREATEST(
-          employees.weekly_minutes,
-          EXCLUDED.weekly_minutes
+          employee.weekly_minutes,
+          session_sums.calculated_weekly
         ),
         updated_at = NOW()
+      FROM session_sums
+      WHERE employee.user_id = session_sums.user_id
+        AND employee.left_server = FALSE
       RETURNING
-        user_id,
-        weekly_minutes,
-        total_minutes;
+        employee.user_id,
+        employee.weekly_minutes,
+        employee.total_minutes;
     `,
     [weekStart, targetUserId]
   );
@@ -4041,9 +4114,10 @@ async function handleFoodbusinessClockOut({
 }) {
   const minutes = Math.max(
     1,
-    Number(durationMinutes) || 1
+    Math.round(Number(durationMinutes) || 1)
   );
 
+  await ensureWeeklyReset();
   await ensureEmployee(member.id);
 
   const sessionResult = await query(
@@ -4124,6 +4198,29 @@ async function handleFoodbusinessClockOut({
         };
       }
 
+      const beforeResult =
+        await databaseClient.query(
+          `
+            SELECT
+              weekly_minutes,
+              total_minutes
+            FROM employees
+            WHERE user_id = $1
+            FOR UPDATE
+          `,
+          [member.id]
+        );
+
+      const beforeWeekly =
+        Number(
+          beforeResult.rows[0]?.weekly_minutes
+        ) || 0;
+
+      const beforeTotal =
+        Number(
+          beforeResult.rows[0]?.total_minutes
+        ) || 0;
+
       await databaseClient.query(
         `
           INSERT INTO work_sessions (
@@ -4144,7 +4241,8 @@ async function handleFoodbusinessClockOut({
             FALSE,
             $6
           )
-          ON CONFLICT DO NOTHING;
+          ON CONFLICT (source_message_id)
+          DO NOTHING;
         `,
         [
           member.id,
@@ -4161,10 +4259,10 @@ async function handleFoodbusinessClockOut({
           `
             UPDATE employees
             SET
-              total_minutes =
-                total_minutes + $2,
               weekly_minutes =
-                weekly_minutes + $2,
+                COALESCE(weekly_minutes, 0) + $2,
+              total_minutes =
+                COALESCE(total_minutes, 0) + $2,
               left_server = FALSE,
               updated_at = NOW()
             WHERE user_id = $1
@@ -4178,6 +4276,26 @@ async function handleFoodbusinessClockOut({
       if (totals.rowCount !== 1) {
         throw new Error(
           `Arbeitszeit konnte für ${member.id} nicht gebucht werden.`
+        );
+      }
+
+      const weeklyMinutes =
+        Number(
+          totals.rows[0].weekly_minutes
+        ) || 0;
+
+      const totalMinutes =
+        Number(
+          totals.rows[0].total_minutes
+        ) || 0;
+
+      if (
+        weeklyMinutes !== beforeWeekly + minutes ||
+        totalMinutes !== beforeTotal + minutes
+      ) {
+        throw new Error(
+          `Zeitprüfung fehlgeschlagen: vorher ${beforeWeekly}/${beforeTotal}, ` +
+          `nachher ${weeklyMinutes}/${totalMinutes}, Buchung ${minutes}.`
         );
       }
 
@@ -4201,10 +4319,8 @@ async function handleFoodbusinessClockOut({
           VALUES ($1, $2, $3, 'System', NOW())
           ON CONFLICT (normalized_name)
           DO UPDATE SET
-            original_name =
-              EXCLUDED.original_name,
-            user_id =
-              EXCLUDED.user_id,
+            original_name = EXCLUDED.original_name,
+            user_id = EXCLUDED.user_id,
             updated_at = NOW();
         `,
         [
@@ -4216,19 +4332,14 @@ async function handleFoodbusinessClockOut({
 
       return {
         alreadyProcessed: false,
-        weeklyMinutes:
-          Number(
-            totals.rows[0].weekly_minutes
-          ) || 0,
-        totalMinutes:
-          Number(
-            totals.rows[0].total_minutes
-          ) || 0,
+        weeklyMinutes,
+        totalMinutes,
       };
     }
   );
 
   if (bookingResult.alreadyProcessed) {
+    await refreshAllTimeDisplays();
     return;
   }
 
@@ -4248,6 +4359,30 @@ async function handleFoodbusinessClockOut({
   employeeRosterCache.lastSource =
     "Foodbusiness-Zeitbuchung";
 
+  // Direkt nach der Buchung nochmals aus Sessions abgleichen.
+  await repairEmployeeTimesFromSessions(member.id);
+
+  const verifiedResult = await query(
+    `
+      SELECT
+        weekly_minutes,
+        total_minutes
+      FROM employees
+      WHERE user_id = $1
+    `,
+    [member.id]
+  );
+
+  const verifiedWeekly =
+    Number(
+      verifiedResult.rows[0]?.weekly_minutes
+    ) || bookingResult.weeklyMinutes;
+
+  const verifiedTotal =
+    Number(
+      verifiedResult.rows[0]?.total_minutes
+    ) || bookingResult.totalMinutes;
+
   const embed = createBaseEmbed(0xed4245)
     .setTitle("🔴 • FOODBUSINESS AUSGESTEMPELT")
     .setDescription(
@@ -4256,10 +4391,10 @@ async function handleFoodbusinessClockOut({
         `👥 **Discord-User**\n└ ${member}\n\n` +
         `⏱️ **Arbeitszeit**\n└ ${formatShortMinutes(minutes)}\n\n` +
         `📊 **Neue Wochenzeit**\n└ ${formatShortMinutes(
-          bookingResult.weeklyMinutes
+          verifiedWeekly
         )}\n\n` +
         `🏆 **Neue Gesamtzeit**\n└ ${formatShortMinutes(
-          bookingResult.totalMinutes
+          verifiedTotal
         )}\n\n` +
         "🔴 **Aktion**\n" +
         "└ Im-Dienst-Rolle wurde entfernt.\n\n" +
@@ -4272,13 +4407,11 @@ async function handleFoodbusinessClockOut({
     });
 
   await sendEmbed(CHANNELS.dutyLogs, embed);
-  await updateTimeOverviewMessages().catch(
-    (error) => {
-      console.error(
-        "❌ Zeitlisten konnten nach dem Ausstempeln nicht aktualisiert werden:",
-        error
-      );
-    }
+  await refreshAllTimeDisplays();
+
+  console.log(
+    `✅ Arbeitszeit gebucht: ${member.id} +${minutes} Min. ` +
+    `(Weekly ${verifiedWeekly}, Gesamt ${verifiedTotal}).`
   );
 }
 
@@ -5272,6 +5405,8 @@ async function handleChatInputCommand(interaction) {
       force: true,
       maxAttempts: 3,
     });
+
+    await repairEmployeeTimesFromSessions();
 
     const type =
       interaction.commandName === "wochenzeiten"
@@ -6601,23 +6736,26 @@ client.once(Events.ClientReady, async (readyClient) => {
     updateBotStatus();
     setInterval(updateBotStatus, SETTINGS.statusIntervalMs);
 
-    // Der Mitarbeiter-Roster wurde direkt zuvor vollständig geladen.
-    // Das Dashboard verwendet deshalb den frischen Cache und startet
-    // keinen zweiten Discord-Member-Fetch.
-    await updateDashboardOverview().catch((error) => {
+    await ensureWeeklyReset();
+    await repairEmployeeTimesFromSessions();
+
+    await refreshAllTimeDisplays().catch((error) => {
       console.warn(
-        "⚠️ Dashboard konnte beim Start nicht aktualisiert werden:",
+        "⚠️ Zeitübersichten konnten beim Start nicht aktualisiert werden:",
         error.message
       );
     });
 
     setInterval(() => {
-      updateDashboardOverview().catch((error) =>
-        console.error(
-          "❌ Dashboard-Aktualisierungsfehler:",
-          error
-        )
-      );
+      ensureWeeklyReset()
+        .then(() => repairEmployeeTimesFromSessions())
+        .then(() => refreshAllTimeDisplays())
+        .catch((error) =>
+          console.error(
+            "❌ Arbeitszeit-Aktualisierungsfehler:",
+            error
+          )
+        );
     }, SETTINGS.dashboardIntervalMs);
 
     setInterval(() => {
