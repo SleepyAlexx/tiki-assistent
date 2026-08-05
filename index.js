@@ -961,47 +961,216 @@ async function initDatabase() {
   console.log("✅ Datenbanktabellen sind bereit.");
 }
 
-async function applyOneTimeWeeklyCleanup() {
-  const migrationKey =
-    "tiki_weekly_cleanup_2026_08_v1";
-
-  const alreadyApplied = await getSetting(
-    migrationKey,
-    "0"
+async function insertMissingProcessedLogsAsWorkSessions(
+  databaseClient,
+  targetUserId = null
+) {
+  await databaseClient.query(
+    `
+      INSERT INTO work_sessions (
+        user_id,
+        ic_name,
+        started_at,
+        ended_at,
+        minutes,
+        corrected,
+        correction_reason,
+        source_message_id
+      )
+      SELECT
+        processed.user_id,
+        processed.ic_name,
+        processed.created_at -
+          (processed.minutes * INTERVAL '1 minute'),
+        processed.created_at,
+        processed.minutes,
+        TRUE,
+        'Aus gespeichertem Foodbusiness-Log rekonstruiert',
+        processed.message_id
+      FROM foodbusiness_processed_logs processed
+      WHERE processed.action = 'clock_out'
+        AND processed.processing_status = 'assigned'
+        AND processed.user_id IS NOT NULL
+        AND processed.minutes > 0
+        AND (
+          $1::text IS NULL OR
+          processed.user_id = $1
+        )
+      ON CONFLICT DO NOTHING;
+    `,
+    [targetUserId]
   );
+}
 
-  if (alreadyApplied === "1") {
-    return 0;
-  }
+async function rebuildCurrentWeekTimes(
+  targetUserId = null
+) {
+  const weekStart = getCurrentWeekStartDateTime();
+  const nextWeekStart = getNextWeekStartDateTime();
 
-  const resetAt = new Date();
-
-  const resetCount = await withTransaction(
+  const result = await withTransaction(
     async (databaseClient) => {
-      const result = await databaseClient.query(`
-        UPDATE employees
-        SET
-          weekly_minutes = 0,
-          updated_at = NOW()
-        RETURNING user_id;
-      `);
+      await insertMissingProcessedLogsAsWorkSessions(
+        databaseClient,
+        targetUserId
+      );
 
-      const verification =
-        await databaseClient.query(`
-          SELECT COUNT(*)::int AS count
-          FROM employees
-          WHERE weekly_minutes <> 0;
-        `);
-
-      if (
-        Number(verification.rows[0]?.count || 0) !== 0
-      ) {
-        throw new Error(
-          "Die alten Wochenzeiten konnten nicht vollständig gelöscht werden."
+      const employeesResult =
+        await databaseClient.query(
+          `
+            SELECT user_id
+            FROM employees
+            WHERE left_server = FALSE
+              AND (
+                $1::text IS NULL OR
+                user_id = $1
+              )
+            ORDER BY user_id ASC;
+          `,
+          [targetUserId]
         );
+
+      const userIds = employeesResult.rows.map(
+        (row) => row.user_id
+      );
+
+      if (userIds.length === 0) {
+        return {
+          employeeCount: 0,
+          totalMinutes: 0,
+          weekStart,
+          nextWeekStart,
+        };
       }
 
-      return result.rowCount;
+      const sessionsResult =
+        await databaseClient.query(
+          `
+            SELECT
+              user_id,
+              ended_at AS event_at,
+              minutes
+            FROM work_sessions
+            WHERE user_id = ANY($1::text[])
+              AND ended_at >= $2
+              AND ended_at < $3
+            ORDER BY ended_at ASC, id ASC;
+          `,
+          [userIds, weekStart, nextWeekStart]
+        );
+
+      const adjustmentsResult =
+        await databaseClient.query(
+          `
+            SELECT
+              user_id,
+              created_at AS event_at,
+              action,
+              minutes,
+              new_weekly_minutes
+            FROM time_adjustments
+            WHERE user_id = ANY($1::text[])
+              AND created_at >= $2
+              AND created_at < $3
+              AND action IN (
+                'add',
+                'remove',
+                'set_weekly'
+              )
+            ORDER BY created_at ASC, id ASC;
+          `,
+          [userIds, weekStart, nextWeekStart]
+        );
+
+      const eventsByUser = new Map(
+        userIds.map((userId) => [userId, []])
+      );
+
+      for (const row of sessionsResult.rows) {
+        eventsByUser.get(row.user_id)?.push({
+          eventAt: new Date(row.event_at),
+          type: "session",
+          minutes: Number(row.minutes) || 0,
+        });
+      }
+
+      for (const row of adjustmentsResult.rows) {
+        eventsByUser.get(row.user_id)?.push({
+          eventAt: new Date(row.event_at),
+          type: row.action,
+          minutes: Number(row.minutes) || 0,
+          newWeeklyMinutes:
+            Number(row.new_weekly_minutes) || 0,
+        });
+      }
+
+      let totalMinutes = 0;
+
+      for (const userId of userIds) {
+        const events = eventsByUser.get(userId) || [];
+
+        events.sort((a, b) => {
+          const difference =
+            a.eventAt.getTime() - b.eventAt.getTime();
+
+          if (difference !== 0) {
+            return difference;
+          }
+
+          return a.type === "session" ? -1 : 1;
+        });
+
+        let weeklyMinutes = 0;
+
+        for (const event of events) {
+          if (event.type === "session") {
+            weeklyMinutes += event.minutes;
+          }
+
+          if (event.type === "add") {
+            weeklyMinutes += event.minutes;
+          }
+
+          if (event.type === "remove") {
+            weeklyMinutes = Math.max(
+              0,
+              weeklyMinutes - event.minutes
+            );
+          }
+
+          if (event.type === "set_weekly") {
+            weeklyMinutes = Math.max(
+              0,
+              event.newWeeklyMinutes
+            );
+          }
+        }
+
+        weeklyMinutes = Math.max(
+          0,
+          Math.round(weeklyMinutes)
+        );
+
+        await databaseClient.query(
+          `
+            UPDATE employees
+            SET
+              weekly_minutes = $2,
+              updated_at = NOW()
+            WHERE user_id = $1;
+          `,
+          [userId, weeklyMinutes]
+        );
+
+        totalMinutes += weeklyMinutes;
+      }
+
+      return {
+        employeeCount: userIds.length,
+        totalMinutes,
+        weekStart,
+        nextWeekStart,
+      };
     }
   );
 
@@ -1012,16 +1181,39 @@ async function applyOneTimeWeeklyCleanup() {
 
   await setSetting(
     "weekly_calculation_start",
-    resetAt.toISOString()
+    result.weekStart.toISOString()
   );
 
+  console.log(
+    `✅ Aktuelle Wochenzeiten rekonstruiert: ` +
+      `${result.employeeCount} Mitarbeiter, ` +
+      `${result.totalMinutes} Minuten.`
+  );
+
+  return result;
+}
+
+async function applyOneTimeCurrentWeekRebuild() {
+  const migrationKey =
+    "tiki_current_week_rebuild_2026_08_v1";
+
+  const alreadyApplied = await getSetting(
+    migrationKey,
+    "0"
+  );
+
+  if (alreadyApplied === "1") {
+    return null;
+  }
+
+  const result = await rebuildCurrentWeekTimes();
   await setSetting(migrationKey, "1");
 
   console.log(
-    `✅ Einmalige Weekly-Bereinigung: ${resetCount} Datensätze auf 0 gesetzt.`
+    "✅ Einmalige Übernahme der laufenden Woche abgeschlossen."
   );
 
-  return resetCount;
+  return result;
 }
 
 // ============================================================
@@ -1062,6 +1254,20 @@ async function registerCommands() {
           .setName("user")
           .setDescription(
             "Optional nur einen bestimmten Mitarbeiter reparieren"
+          )
+          .setRequired(false)
+      ),
+
+    new SlashCommandBuilder()
+      .setName("wochenzeiten-neuberechnen")
+      .setDescription(
+        "Berechnet die Zeiten dieser Woche aus gespeicherten Diensten neu."
+      )
+      .addUserOption((option) =>
+        option
+          .setName("user")
+          .setDescription(
+            "Optional nur einen bestimmten Mitarbeiter neu berechnen"
           )
           .setRequired(false)
       ),
@@ -2295,33 +2501,57 @@ function getCurrentWeekStartDateTime() {
   });
 }
 
+function getNextWeekStartDateTime() {
+  const {
+    year,
+    month,
+    day,
+  } = getCurrentDatePartsInTimeZone();
+
+  const calendarDate =
+    new Date(Date.UTC(year, month - 1, day));
+
+  const currentWeekday =
+    calendarDate.getUTCDay();
+
+  let daysUntilMonday =
+    (8 - currentWeekday) % 7;
+
+  if (daysUntilMonday === 0) {
+    daysUntilMonday = 7;
+  }
+
+  calendarDate.setUTCDate(
+    calendarDate.getUTCDate() + daysUntilMonday
+  );
+
+  return createDateInTimeZone({
+    year: calendarDate.getUTCFullYear(),
+    month: calendarDate.getUTCMonth() + 1,
+    day: calendarDate.getUTCDate(),
+    hour: 0,
+    minute: 0,
+  });
+}
+
 function getCurrentWeekKey() {
   return getCurrentWeekStartDateTime()
     .toISOString()
     .slice(0, 10);
 }
 
-async function ensureWeeklyReset() {
-  const currentWeekKey = getCurrentWeekKey();
-  const currentWeekStart =
-    getCurrentWeekStartDateTime();
-
-  const storedWeekKey = await getSetting(
-    "weekly_reset_week_key",
-    null
-  );
-
-  if (storedWeekKey === currentWeekKey) {
-    return false;
-  }
-
-  await withTransaction(
+async function resetWeeklyMinutes({
+  reason = "Automatischer Wochenreset",
+  resetAt = getCurrentWeekStartDateTime(),
+} = {}) {
+  const resetCount = await withTransaction(
     async (databaseClient) => {
-      await databaseClient.query(`
+      const result = await databaseClient.query(`
         UPDATE employees
         SET
           weekly_minutes = 0,
-          updated_at = NOW();
+          updated_at = NOW()
+        RETURNING user_id;
       `);
 
       const verification =
@@ -2335,27 +2565,106 @@ async function ensureWeeklyReset() {
         Number(verification.rows[0]?.count || 0) !== 0
       ) {
         throw new Error(
-          "Der automatische Wochenreset konnte nicht vollständig durchgeführt werden."
+          "Der Wochenreset konnte nicht vollständig durchgeführt werden."
         );
       }
+
+      return result.rowCount;
     }
   );
 
   await setSetting(
     "weekly_reset_week_key",
-    currentWeekKey
+    getCurrentWeekKey()
   );
 
   await setSetting(
     "weekly_calculation_start",
-    currentWeekStart.toISOString()
+    resetAt.toISOString()
   );
 
   console.log(
-    `✅ Automatischer Wochenreset für ${currentWeekKey} abgeschlossen.`
+    `✅ ${reason}: ${resetCount} Wochenzeiten auf 0 gesetzt.`
   );
 
+  return resetCount;
+}
+
+async function ensureWeeklyReset() {
+  const currentWeekKey = getCurrentWeekKey();
+  const storedWeekKey = await getSetting(
+    "weekly_reset_week_key",
+    null
+  );
+
+  if (!storedWeekKey) {
+    await setSetting(
+      "weekly_reset_week_key",
+      currentWeekKey
+    );
+
+    await setSetting(
+      "weekly_calculation_start",
+      getCurrentWeekStartDateTime().toISOString()
+    );
+
+    return false;
+  }
+
+  if (storedWeekKey === currentWeekKey) {
+    return false;
+  }
+
+  await resetWeeklyMinutes({
+    reason:
+      "Nachgeholter Montagsreset nach Offlinezeit",
+    resetAt: getCurrentWeekStartDateTime(),
+  });
+
   return true;
+}
+
+let weeklyResetTimer = null;
+
+function scheduleNextMondayReset() {
+  if (weeklyResetTimer) {
+    clearTimeout(weeklyResetTimer);
+  }
+
+  const nextReset = getNextWeekStartDateTime();
+  const delayMs = Math.max(
+    1_000,
+    nextReset.getTime() - Date.now()
+  );
+
+  console.log(
+    `🕛 Nächster Weekly-Reset: ${formatDateTime(nextReset)}`
+  );
+
+  weeklyResetTimer = setTimeout(
+    async () => {
+      try {
+        await resetWeeklyMinutes({
+          reason:
+            "Automatischer Montagsreset um 00:00 Uhr",
+          resetAt: nextReset,
+        });
+
+        // Falls der Timer minimal verspätet läuft, werden bereits
+        // gespeicherte Dienste seit Montag direkt wieder übernommen.
+        await rebuildCurrentWeekTimes();
+        await refreshAllTimeDisplays();
+      } catch (error) {
+        console.error(
+          "❌ Automatischer Montagsreset fehlgeschlagen:",
+          error
+        );
+      } finally {
+        scheduleNextMondayReset();
+      }
+    },
+    delayMs
+  );
 }
 
 async function repairEmployeeTimesFromSessions(
@@ -4453,9 +4762,7 @@ async function handleFoodbusinessClockOut({
   employeeRosterCache.lastSource =
     "Foodbusiness-Zeitbuchung";
 
-  // Direkt nach der Buchung nochmals aus Sessions abgleichen.
-  await repairEmployeeTimesFromSessions(member.id);
-
+  // Die Buchung wurde bereits atomar in Weekly und Gesamt gespeichert.
   const verifiedResult = await query(
     `
       SELECT
@@ -5191,7 +5498,9 @@ async function handleChatInputCommand(interaction) {
           "🔄 `/mitarbeiter-sync`\n" +
           "└ Mitarbeiterrollen vollständig neu einlesen\n\n" +
           "🧰 `/arbeitszeiten-reparieren`\n" +
-          "└ Fehlende alte Zeitbuchungen aus gespeicherten Diensten übernehmen\n\n" +
+          "└ Fehlende alte Zeitbuchungen sicher in die Gesamtzeit übernehmen\n\n" +
+          "🔄 `/wochenzeiten-neuberechnen`\n" +
+          "└ Aktuelle Woche aus Diensten und Zeitkorrekturen wiederherstellen\n\n" +
           "🧹 `/wochenzeiten-reset`\n" +
           "└ Alte Wochenzeiten auf 0 setzen, ohne Gesamtzeiten zu löschen\n\n" +
           "🔎 `/arbeitszeit-check`\n" +
@@ -5216,6 +5525,7 @@ async function handleChatInputCommand(interaction) {
     "dashboard",
     "mitarbeiter-sync",
     "arbeitszeiten-reparieren",
+    "wochenzeiten-neuberechnen",
     "wochenzeiten-reset",
     "arbeitszeit-check",
     "wochenzeiten",
@@ -5333,83 +5643,58 @@ async function handleChatInputCommand(interaction) {
     );
   }
 
+  if (
+    interaction.commandName ===
+    "wochenzeiten-neuberechnen"
+  ) {
+    const target =
+      interaction.options.getUser("user");
+
+    await interaction.deferReply({
+      flags: MessageFlags.Ephemeral,
+    });
+
+    await refreshEmployeeRoster({
+      force: true,
+      maxAttempts: 3,
+    });
+
+    const result = await rebuildCurrentWeekTimes(
+      target?.id || null
+    );
+
+    await updateTimeOverviewMessages();
+
+    return interaction.editReply(
+      target
+        ? `✅ Die aktuelle Wochenzeit von ${target} wurde aus den ` +
+            "gespeicherten Diensten und Zeitkorrekturen neu berechnet."
+        : `✅ Die aktuelle Woche wurde für **${result.employeeCount} ` +
+            `Mitarbeiter** neu berechnet.\n` +
+            `Übernommene Wochenzeit insgesamt: **${formatShortMinutes(
+              result.totalMinutes
+            )}**`
+    );
+  }
+
   if (interaction.commandName === "wochenzeiten-reset") {
     await interaction.deferReply({
       flags: MessageFlags.Ephemeral,
     });
 
-    const resetAt = new Date();
-    const currentWeekKey = getCurrentWeekKey();
-
-    const resetCount = await withTransaction(
-      async (databaseClient) => {
-        const updated = await databaseClient.query(`
-          UPDATE employees
-          SET
-            weekly_minutes = 0,
-            updated_at = NOW()
-          RETURNING user_id;
-        `);
-
-        const verification =
-          await databaseClient.query(`
-            SELECT COUNT(*)::int AS remaining_count
-            FROM employees
-            WHERE weekly_minutes <> 0;
-          `);
-
-        const remainingCount = Number(
-          verification.rows[0]?.remaining_count || 0
-        );
-
-        if (remainingCount !== 0) {
-          throw new Error(
-            `${remainingCount} Wochenzeit-Datensätze sind weiterhin ungleich 0.`
-          );
-        }
-
-        return updated.rowCount;
-      }
-    );
-
-    await setSetting(
-      "weekly_reset_week_key",
-      currentWeekKey
-    );
-
-    await setSetting(
-      "weekly_calculation_start",
-      resetAt.toISOString()
-    );
-
-    await updateConfiguredLeaderboard(
-      "weekly"
-    ).catch((error) => {
-      console.error(
-        "❌ Wochenzeiten-Nachricht konnte nach dem Reset nicht aktualisiert werden:",
-        error
-      );
+    const resetCount = await resetWeeklyMinutes({
+      reason:
+        `Manueller Wochenreset durch ${interaction.user.id}`,
+      resetAt: new Date(),
     });
 
-    await updateDashboardMessage().catch(
-      () => null
-    );
-
-    const finalCheck = await query(`
-      SELECT COUNT(*)::int AS remaining_count
-      FROM employees
-      WHERE weekly_minutes <> 0;
-    `);
-
-    const remainingCount = Number(
-      finalCheck.rows[0]?.remaining_count || 0
-    );
+    await updateTimeOverviewMessages();
 
     return interaction.editReply(
-      `✅ **Harter Wochenzeiten-Reset abgeschlossen.**\n` +
-        `Zurückgesetzte Datenbankeinträge: **${resetCount}**\n` +
-        `Verbleibende Werte ungleich 0: **${remainingCount}**\n` +
-        "Die Gesamtzeiten wurden nicht verändert."
+      `✅ Die Wochenzeiten von **${resetCount} Mitarbeitern** ` +
+        "wurden auf **0** gesetzt. Die Gesamtzeiten bleiben unverändert.\n" +
+        "Mit `/wochenzeiten-neuberechnen` können die gespeicherten " +
+        "Dienste dieser Woche wiederhergestellt werden."
     );
   }
 
@@ -6915,8 +7200,25 @@ client.once(Events.ClientReady, async (readyClient) => {
     updateBotStatus();
     setInterval(updateBotStatus, SETTINGS.statusIntervalMs);
 
-    await applyOneTimeWeeklyCleanup();
-    await ensureWeeklyReset();
+    const weeklyResetWasRequired =
+      await ensureWeeklyReset();
+
+    if (weeklyResetWasRequired) {
+      await rebuildCurrentWeekTimes();
+    }
+
+    const rebuiltWeek =
+      await applyOneTimeCurrentWeekRebuild();
+
+    scheduleNextMondayReset();
+
+    if (rebuiltWeek) {
+      console.log(
+        `✅ Wochenzeiten dieser Woche übernommen: ` +
+          `${rebuiltWeek.employeeCount} Mitarbeiter, ` +
+          `${rebuiltWeek.totalMinutes} Minuten.`
+      );
+    }
 
     await refreshAllTimeDisplays().catch((error) => {
       console.warn(
@@ -6927,7 +7229,13 @@ client.once(Events.ClientReady, async (readyClient) => {
 
     setInterval(() => {
       ensureWeeklyReset()
-        .then(() => refreshAllTimeDisplays())
+        .then(async (wasReset) => {
+          if (wasReset) {
+            await rebuildCurrentWeekTimes();
+          }
+
+          await refreshAllTimeDisplays();
+        })
         .catch((error) =>
           console.error(
             "❌ Arbeitszeit-Aktualisierungsfehler:",
