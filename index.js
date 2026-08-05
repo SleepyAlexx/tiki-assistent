@@ -1004,6 +1004,12 @@ async function registerCommands() {
       ),
 
     new SlashCommandBuilder()
+      .setName("wochenzeiten-reset")
+      .setDescription(
+        "Setzt alle aktuellen Wochenzeiten auf 0. Gesamtzeiten bleiben erhalten."
+      ),
+
+    new SlashCommandBuilder()
       .setName("arbeitszeit-check")
       .setDescription(
         "Prüft Rollen, Datenbank und Foodbusiness-Buchungen eines Mitarbeiters."
@@ -1707,10 +1713,8 @@ async function getTrackedDashboardMembers() {
 }
 
 async function getDashboardTimeSnapshot() {
-  // Vor jeder Zeitübersicht werden fehlende Foodbusiness-Buchungen
-  // aus work_sessions/processed_logs in Weekly und Gesamt übernommen.
-  await repairEmployeeTimesFromSessions();
-
+  // Stabile Quelle ist ausschließlich die employees-Tabelle.
+  // Alte Sessions werden nicht bei jeder Anzeige erneut in Weekly geladen.
   const timeResult = await query(
     `
       SELECT
@@ -2236,30 +2240,24 @@ function getCurrentWeekKey() {
 
 async function ensureWeeklyReset() {
   const currentWeekKey = getCurrentWeekKey();
+  const currentWeekStart = getCurrentWeekStartDateTime();
   const storedWeekKey = await getSetting(
     "weekly_reset_week_key",
     null
   );
 
-  // Beim allerersten Start wird nur die aktuelle Woche gespeichert.
-  // Bereits in dieser Woche vorhandene Zeiten bleiben dadurch erhalten.
-  if (!storedWeekKey) {
-    await setSetting(
-      "weekly_reset_week_key",
-      currentWeekKey
-    );
-    return false;
-  }
-
   if (storedWeekKey === currentWeekKey) {
     return false;
   }
 
+  // Auch beim ersten Einsatz dieser Version werden alte Weekly-Werte
+  // entfernt. Die Gesamtzeiten bleiben vollständig erhalten.
   await query(`
     UPDATE employees
     SET
       weekly_minutes = 0,
-      updated_at = NOW();
+      updated_at = NOW()
+    WHERE left_server = FALSE;
   `);
 
   await setSetting(
@@ -2267,8 +2265,13 @@ async function ensureWeeklyReset() {
     currentWeekKey
   );
 
+  await setSetting(
+    "weekly_calculation_start",
+    currentWeekStart.toISOString()
+  );
+
   console.log(
-    `✅ Wochenzeiten wurden für die neue Woche ${currentWeekKey} zurückgesetzt.`
+    `✅ Wochenzeiten wurden für ${currentWeekKey} auf 0 gesetzt.`
   );
 
   return true;
@@ -2280,6 +2283,20 @@ async function repairEmployeeTimesFromSessions(
   await ensureWeeklyReset();
 
   const weekStart = getCurrentWeekStartDateTime();
+  const storedCalculationStart = await getSetting(
+    "weekly_calculation_start",
+    weekStart.toISOString()
+  );
+
+  const parsedCalculationStart = new Date(
+    storedCalculationStart
+  );
+
+  const weeklyCalculationStart =
+    Number.isNaN(parsedCalculationStart.getTime()) ||
+    parsedCalculationStart < weekStart
+      ? weekStart
+      : parsedCalculationStart;
 
   // Ältere verarbeitete Foodbusiness-Logs werden als Work-Session
   // rekonstruiert, falls damalige Bot-Versionen nur den Log speicherten.
@@ -2358,7 +2375,7 @@ async function repairEmployeeTimesFromSessions(
         employee.weekly_minutes,
         employee.total_minutes;
     `,
-    [weekStart, targetUserId]
+    [weeklyCalculationStart, targetUserId]
   );
 
   return result.rows;
@@ -5098,6 +5115,8 @@ async function handleChatInputCommand(interaction) {
           "└ Mitarbeiterrollen vollständig neu einlesen\n\n" +
           "🧰 `/arbeitszeiten-reparieren`\n" +
           "└ Fehlende alte Zeitbuchungen aus gespeicherten Diensten übernehmen\n\n" +
+          "🧹 `/wochenzeiten-reset`\n" +
+          "└ Alte Wochenzeiten auf 0 setzen, ohne Gesamtzeiten zu löschen\n\n" +
           "🔎 `/arbeitszeit-check`\n" +
           "└ Rollen, Datenbank und letzte Foodbusiness-Buchungen prüfen\n\n" +
           "🔧 `/dienst-korrektur`\n" +
@@ -5120,6 +5139,7 @@ async function handleChatInputCommand(interaction) {
     "dashboard",
     "mitarbeiter-sync",
     "arbeitszeiten-reparieren",
+    "wochenzeiten-reset",
     "arbeitszeit-check",
     "wochenzeiten",
     "gesamtzeiten",
@@ -5233,6 +5253,41 @@ async function handleChatInputCommand(interaction) {
         : `✅ Die Arbeitszeiten von **${repairedRows.length} ` +
             "Mitarbeitern** wurden mit den gespeicherten " +
             "Diensten abgeglichen."
+    );
+  }
+
+  if (interaction.commandName === "wochenzeiten-reset") {
+    await interaction.deferReply({
+      flags: MessageFlags.Ephemeral,
+    });
+
+    const resetAt = new Date();
+    const currentWeekKey = getCurrentWeekKey();
+
+    const resetResult = await query(`
+      UPDATE employees
+      SET
+        weekly_minutes = 0,
+        updated_at = NOW()
+      WHERE left_server = FALSE
+      RETURNING user_id;
+    `);
+
+    await setSetting(
+      "weekly_reset_week_key",
+      currentWeekKey
+    );
+
+    await setSetting(
+      "weekly_calculation_start",
+      resetAt.toISOString()
+    );
+
+    await updateTimeOverviewMessages();
+
+    return interaction.editReply(
+      `✅ Die Wochenzeiten von **${resetResult.rowCount} Mitarbeitern** ` +
+        "wurden auf **0** gesetzt. Die Gesamtzeiten bleiben unverändert."
     );
   }
 
