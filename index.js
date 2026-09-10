@@ -127,8 +127,13 @@ const EMPLOYEE_ROLE_IDS = [
 // Exakt wie beim aktuellen CaffeeContainer-Bot:
 // Nur Mitarbeiter und Probe-Mitarbeiter zählen in den Zeitlisten.
 const COUNTED_EMPLOYEE_ROLE_IDS = [
-  ROLES.employee,
-  ROLES.probationEmployee,
+  "1526427753707081749", // Probe-Mitarbeiter
+  "1526427753707081750", // Mitarbeiter
+  "1526427753707081754", // Probe-Manager
+  "1526427753707081755", // Manager
+  "1526427753707081756", // Personal Manager
+  "1526427753740767356", // Stv. Inhaber
+  "1526427753740767358", // Inhaber
 ];
 
 const TEAM_ROLE_IDS = [
@@ -613,6 +618,61 @@ async function ensureEmployee(userId) {
   );
 }
 
+async function purgeEmployeeTimeData(
+  userId,
+  reason = "Keine berechtigte Zeitrolle mehr vorhanden"
+) {
+  await withTransaction(async (databaseClient) => {
+    await databaseClient.query(
+      `DELETE FROM active_sessions WHERE user_id = $1`,
+      [userId]
+    );
+
+    await databaseClient.query(
+      `DELETE FROM stale_duty_alerts WHERE user_id = $1`,
+      [userId]
+    );
+
+    await databaseClient.query(
+      `DELETE FROM duty_corrections WHERE user_id = $1`,
+      [userId]
+    );
+
+    await databaseClient.query(
+      `DELETE FROM time_adjustments WHERE user_id = $1`,
+      [userId]
+    );
+
+    await databaseClient.query(
+      `DELETE FROM work_sessions WHERE user_id = $1`,
+      [userId]
+    );
+
+    await databaseClient.query(
+      `DELETE FROM foodbusiness_processed_logs WHERE user_id = $1`,
+      [userId]
+    );
+
+    await databaseClient.query(
+      `DELETE FROM foodbusiness_name_mappings WHERE user_id = $1`,
+      [userId]
+    );
+
+    await databaseClient.query(
+      `DELETE FROM employees WHERE user_id = $1`,
+      [userId]
+    );
+  });
+
+  employeeRosterCache.userIds.delete(userId);
+  employeeRosterCache.lastRefreshAt = Date.now();
+  employeeRosterCache.lastSource = "Zeitdaten-Bereinigung";
+
+  console.log(
+    `🗑️ Zeitdaten von ${userId} vollständig gelöscht: ${reason}`
+  );
+}
+
 async function creditEmployeeMinutes(
   databaseClient,
   userId,
@@ -766,16 +826,13 @@ async function initDatabase() {
       AND older.id > newer.id;
   `);
 
-  // PostgreSQL erlaubt bei einem normalen UNIQUE-Index mehrere NULL-Werte.
-  // Deshalb wird hier bewusst kein partieller Index verwendet:
-  // ON CONFLICT (source_message_id) kann den Index dann eindeutig erkennen.
   await query(`
     DROP INDEX IF EXISTS
       work_sessions_source_message_unique;
   `);
 
   await query(`
-    CREATE UNIQUE INDEX
+    CREATE UNIQUE INDEX IF NOT EXISTS
       work_sessions_source_message_unique
     ON work_sessions (source_message_id);
   `);
@@ -1568,69 +1625,26 @@ async function fetchGuildMembersOnce(maxAttempts = 3) {
 async function persistEmployeeRoster(employeeIds) {
   const uniqueIds = [...new Set(employeeIds)];
 
-  await withTransaction(async (databaseClient) => {
-    if (uniqueIds.length > 0) {
-      await databaseClient.query(
-        `
-          INSERT INTO employees (
-            user_id,
-            total_minutes,
-            weekly_minutes,
-            left_server,
-            updated_at
-          )
-          SELECT
-            roster.user_id,
-            0,
-            0,
-            FALSE,
-            NOW()
-          FROM UNNEST($1::text[]) AS roster(user_id)
-          ON CONFLICT (user_id)
-          DO UPDATE SET
-            left_server = FALSE,
-            updated_at = NOW();
-        `,
-        [uniqueIds]
-      );
+  const existing = await query(`
+    SELECT user_id
+    FROM employees
+    ORDER BY user_id ASC;
+  `);
 
-      await databaseClient.query(
-        `
-          UPDATE employees
-          SET
-            left_server = TRUE,
-            updated_at = NOW()
-          WHERE NOT (
-            user_id = ANY($1::text[])
-          );
-        `,
-        [uniqueIds]
-      );
+  const allowedSet = new Set(uniqueIds);
 
-      await databaseClient.query(
-        `
-          DELETE FROM active_sessions
-          WHERE NOT (
-            user_id = ANY($1::text[])
-          );
-        `,
-        [uniqueIds]
-      );
-    } else {
-      await databaseClient.query(
-        `
-          UPDATE employees
-          SET
-            left_server = TRUE,
-            updated_at = NOW();
-        `
-      );
+  for (const userId of uniqueIds) {
+    await ensureEmployee(userId);
+  }
 
-      await databaseClient.query(
-        `DELETE FROM active_sessions;`
+  for (const row of existing.rows) {
+    if (!allowedSet.has(row.user_id)) {
+      await purgeEmployeeTimeData(
+        row.user_id,
+        "Rollen-Sync: keine berechtigte Zeitrolle mehr"
       );
     }
-  });
+  }
 
   return uniqueIds;
 }
@@ -3615,17 +3629,9 @@ async function terminateEmployee({
     );
   }
 
-  await query(`DELETE FROM active_sessions WHERE user_id = $1`, [
+  await purgeEmployeeTimeData(
     targetUserId,
-  ]);
-
-  await query(
-    `
-      UPDATE employees
-      SET left_server = TRUE, updated_at = NOW()
-      WHERE user_id = $1;
-    `,
-    [targetUserId]
+    `Kündigung durch ${issuerId}`
   );
 
   await query(
@@ -3811,13 +3817,14 @@ async function applyTimeAdjustment({
 }
 
 // ============================================================
-// FOODBUSINESS-ERKENNUNG
+// FOODBUSINESS-ERKENNUNG – NEUES STABILES SYSTEM
 // ============================================================
 
 function collectMessageText(message) {
   const parts = [message.content || ""];
 
   for (const embed of message.embeds || []) {
+    if (embed.author?.name) parts.push(embed.author.name);
     if (embed.title) parts.push(embed.title);
     if (embed.description) parts.push(embed.description);
 
@@ -3831,29 +3838,92 @@ function collectMessageText(message) {
     }
   }
 
-  return parts.filter(Boolean).join("\n");
+  return parts
+    .filter(Boolean)
+    .join("\n")
+    .replace(/\u00a0/g, " ")
+    .trim();
+}
+
+function normalizeFoodBusinessName(name) {
+  return String(name || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[`*_~|>]/g, "")
+    .replace(/[^a-z0-9äöüß\s-]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripDiscordPrefix(name) {
+  return String(name || "")
+    .replace(/^[A-ZÄÖÜ]{1,12}\s*\|\s*/i, "")
+    .replace(/^TIKI\s*[-|]\s*/i, "")
+    .trim();
 }
 
 function extractFoodbusinessAction(text) {
-  if (/hat\s+sich\s+eingestempelt/i.test(text)) return "clock_in";
-  if (/hat\s+sich\s+ausgestempelt/i.test(text)) return "clock_out";
+  const clean = String(text || "");
+
+  if (
+    /(?:hat\s+sich\s+)?eingestempelt/i.test(clean) ||
+    /\bEINGESTEMPELT\b/i.test(clean)
+  ) {
+    return "clock_in";
+  }
+
+  if (
+    /(?:hat\s+sich\s+)?ausgestempelt/i.test(clean) ||
+    /\bAUSGESTEMPELT\b/i.test(clean)
+  ) {
+    return "clock_out";
+  }
+
   return null;
 }
 
 function extractFoodbusinessName(text) {
+  const clean = String(text || "");
+
   const patterns = [
-    /Der\s+Mitarbeiter\s+(.+?)\s+\(ID:\s*\d+\)/i,
-    /Mitarbeiter\s*[:\n]\s*(.+?)\s+\(ID:\s*\d+\)/i,
-    /Mitarbeiter\s+(.+?)\s+\(ID:\s*\d+\)/i,
+    /Der\s+Mitarbeiter\s+(.+?)\s*\(ID\s*:\s*\d+\)\s*hat\s+sich/i,
+    /Mitarbeiter\s*[:\n]\s*(.+?)\s*\(ID\s*:\s*\d+\)/i,
+    /Mitarbeiter\s+(.+?)\s*\(ID\s*:\s*\d+\)/i,
+    /IC-Name\s*[:\n└\s]+\s*(.+?)(?:\n|$)/i,
+    /Name\s*[:\n└\s]+\s*(.+?)(?:\n|$)/i,
   ];
 
   for (const pattern of patterns) {
-    const match = text.match(pattern);
+    const match = clean.match(pattern);
 
     if (match?.[1]) {
       return formatName(
         match[1]
-          .replace(/[`*_~|>]/g, "")
+          .replace(/[`*_~|>└]/g, "")
+          .replace(/\s+/g, " ")
+          .trim()
+      );
+    }
+  }
+
+  return null;
+}
+
+function extractNpcActorName(text) {
+  const clean = String(text || "");
+
+  const patterns = [
+    /(?:Mitarbeiter|Verkäufer|Verkaeufer|Kassierer|Bearbeiter|IC-Name)\s*[:\n└\s]+\s*(.+?)(?:\s*\(ID\s*:\s*\d+\)|\n|$)/i,
+    /Der\s+Mitarbeiter\s+(.+?)\s*\(ID\s*:\s*\d+\)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = clean.match(pattern);
+    if (match?.[1]) {
+      return formatName(
+        match[1]
+          .replace(/[`*_~|>└]/g, "")
           .replace(/\s+/g, " ")
           .trim()
       );
@@ -3868,31 +3938,19 @@ function extractFoodbusinessDurationMinutes(text) {
     .replace(/\u00a0/g, " ")
     .replace(/\s+/g, " ");
 
-  const fullMatch = cleanText.match(
-    /Dauer:\s*(\d+)\s*(?:Stunden?|Std\.?)[,\s]+(\d+)\s*(?:Minuten?|Min\.?)[,\s]+([\d.,]+)\s*(?:Sekunden?|Sek\.?)/i
+  const durationSection =
+    cleanText.match(
+      /Dauer\s*:\s*([^|]+?)(?=(?:Business|Mitarbeiter|Zeitstempel|$))/i
+    )?.[1] || cleanText;
+
+  const hoursMatch = durationSection.match(
+    /(\d+)\s*(?:Stunden?|Std\.?|h)\b/i
   );
-
-  if (fullMatch) {
-    const hours = Number(fullMatch[1]);
-    const minutes = Number(fullMatch[2]);
-    const seconds = Number(
-      String(fullMatch[3]).replace(",", ".")
-    );
-
-    const totalSeconds =
-      hours * 3600 + minutes * 60 + seconds;
-
-    return Math.max(1, Math.ceil(totalSeconds / 60));
-  }
-
-  const hoursMatch = cleanText.match(
-    /(\d+)\s*(?:Stunden?|Std\.?)/i
+  const minutesMatch = durationSection.match(
+    /(\d+)\s*(?:Minuten?|Min\.?|m)\b/i
   );
-  const minutesMatch = cleanText.match(
-    /(\d+)\s*(?:Minuten?|Min\.?)/i
-  );
-  const secondsMatch = cleanText.match(
-    /([\d.,]+)\s*(?:Sekunden?|Sek\.?)/i
+  const secondsMatch = durationSection.match(
+    /([\d.,]+)\s*(?:Sekunden?|Sek\.?|s)\b/i
   );
 
   if (!hoursMatch && !minutesMatch && !secondsMatch) {
@@ -3908,29 +3966,17 @@ function extractFoodbusinessDurationMinutes(text) {
   const totalSeconds =
     hours * 3600 + minutes * 60 + seconds;
 
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) {
+    return null;
+  }
+
   return Math.max(1, Math.ceil(totalSeconds / 60));
 }
 
-function normalizeFoodBusinessName(name) {
-  return String(name || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function stripDiscordPrefix(name) {
-  return String(name || "")
-    .replace(/^[A-ZÄÖÜ]{1,8}\s*\|\s*/i, "")
-    .replace(/^TIKI\s*[-|]\s*/i, "")
-    .trim();
-}
-
 async function findMemberByIcName(guild, icName) {
-  const normalized =
-    normalizeFoodBusinessName(icName);
+  if (!guild || !icName) return null;
+
+  const normalized = normalizeFoodBusinessName(icName);
 
   const mapped = await query(
     `
@@ -3946,7 +3992,10 @@ async function findMemberByIcName(guild, icName) {
       .fetch(mapped.rows[0].user_id)
       .catch(() => null);
 
-    if (mappedMember) {
+    if (
+      mappedMember &&
+      isCountedEmployeeMember(mappedMember)
+    ) {
       return mappedMember;
     }
   }
@@ -3955,27 +4004,34 @@ async function findMemberByIcName(guild, icName) {
   const matches = [];
 
   for (const member of members.values()) {
-    if (member.user.bot) continue;
+    if (
+      member.user.bot ||
+      !isCountedEmployeeMember(member)
+    ) {
+      continue;
+    }
 
     const display =
       member.nickname ||
       member.user.globalName ||
       member.user.username;
 
-    const cleanDisplay =
-      stripDiscordPrefix(display);
-
-    const normalizedDisplay =
-      normalizeFoodBusinessName(cleanDisplay);
-
-    const normalizedFull =
-      normalizeFoodBusinessName(display);
+    const candidates = [
+      display,
+      stripDiscordPrefix(display),
+      member.user.globalName,
+      member.user.username,
+    ]
+      .filter(Boolean)
+      .map(normalizeFoodBusinessName);
 
     if (
-      normalizedDisplay === normalized ||
-      normalizedFull === normalized ||
-      normalizedFull.includes(normalized) ||
-      normalized.includes(normalizedDisplay)
+      candidates.some(
+        (candidate) =>
+          candidate === normalized ||
+          candidate.includes(normalized) ||
+          normalized.includes(candidate)
+      )
     ) {
       matches.push(member);
     }
@@ -3983,15 +4039,6 @@ async function findMemberByIcName(guild, icName) {
 
   if (matches.length === 1) {
     return matches[0];
-  }
-
-  if (matches.length > 1) {
-    const employeeMatches =
-      matches.filter(isCountedEmployeeMember);
-
-    if (employeeMatches.length === 1) {
-      return employeeMatches[0];
-    }
   }
 
   return null;
@@ -4031,7 +4078,8 @@ async function saveFoodbusinessProcessed({
         original_text
       )
       VALUES ($1, $2, $3, $4, $5, $6, $7)
-      ON CONFLICT (message_id) DO NOTHING;
+      ON CONFLICT (message_id)
+      DO NOTHING;
     `,
     [
       messageId,
@@ -4045,119 +4093,10 @@ async function saveFoodbusinessProcessed({
   );
 }
 
-async function sendUnresolvedFoodbusinessLog({
+async function saveFoodbusinessNameMapping(
   icName,
-  action,
-  originalText,
-}) {
-  const actionText =
-    action === "clock_in" ? "Einstempeln" : "Ausstempeln";
-
-  const embed = createBaseEmbed(0xfee75c)
-    .setTitle("⚠️ • FOODBUSINESS NICHT ZUGEORDNET")
-    .setDescription(
-      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-        `👤 **IC-Name**\n└ ${icName || "Nicht erkannt"}\n\n` +
-        `🛠️ **Aktion**\n└ ${actionText}\n\n` +
-        "❌ **Problem**\n" +
-        "└ Kein eindeutiger Discord-Name gefunden.\n\n" +
-        "📄 **Originalmeldung**\n" +
-        `└ ${originalText.slice(0, 1000)}\n` +
-        "━━━━━━━━━━━━━━━━━━━━━━━━"
-    );
-
-  await sendEmbed(CHANNELS.dutyLogs, embed);
-}
-
-async function ensureFoodbusinessEmployeeEligibility({
-  message,
-  member,
-  icName,
-  action,
-  durationMinutes,
-  originalText,
-}) {
-  if (isEmployee(member)) {
-    await ensureEmployee(member.id);
-
-    employeeRosterCache.userIds.add(member.id);
-    employeeRosterCache.lastRefreshAt = Date.now();
-    employeeRosterCache.lastSource =
-      "Foodbusiness-Zuordnung mit Mitarbeiterrolle";
-
-    return true;
-  }
-
-  await saveFoodbusinessProcessed({
-    messageId: message.id,
-    userId: member.id,
-    icName,
-    action,
-    minutes: durationMinutes || 0,
-    status: "ignored_missing_employee_role",
-    originalText,
-  });
-
-  const embed = createBaseEmbed(0xfee75c)
-    .setTitle("⚠️ • FOODBUSINESS NICHT GEBUCHT")
-    .setDescription(
-      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
-        `👤 **IC-Name**\n└ ${icName}\n\n` +
-        `👥 **Discord-User**\n└ ${member}\n\n` +
-        "❌ **Grund**\n" +
-        "└ Die Person besitzt weder die Mitarbeiter- noch die Probe-Mitarbeiterrolle.\n\n" +
-        "📌 **Folge**\n" +
-        "└ Die Arbeitszeit wurde nicht in Wochen- oder Gesamtzeit übernommen.\n" +
-        "━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    .setFooter({
-      text: "Tiki Bar • Foodbusiness Rollenprüfung",
-    });
-
-  await sendEmbed(CHANNELS.dutyLogs, embed);
-  return false;
-}
-
-async function handleFoodbusinessClockIn({
-  message,
-  member,
-  icName,
-  originalText,
-}) {
-  await query(
-    `
-      INSERT INTO active_sessions (
-        user_id,
-        ic_name,
-        started_at,
-        source_message_id
-      )
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (user_id)
-      DO UPDATE SET
-        ic_name = EXCLUDED.ic_name,
-        started_at = EXCLUDED.started_at,
-        source_message_id = EXCLUDED.source_message_id;
-    `,
-    [member.id, icName, message.createdAt, message.id]
-  );
-
-  await safeAddRoles(
-    member,
-    ROLES.onDuty,
-    "Automatisch über Foodbusiness eingestempelt"
-  );
-
-  await saveFoodbusinessProcessed({
-    messageId: message.id,
-    userId: member.id,
-    icName,
-    action: "clock_in",
-    minutes: 0,
-    status: "assigned",
-    originalText,
-  });
-
+  userId
+) {
   await query(
     `
       INSERT INTO foodbusiness_name_mappings (
@@ -4177,14 +4116,145 @@ async function handleFoodbusinessClockIn({
     [
       normalizeFoodBusinessName(icName),
       icName,
-      member.id,
+      userId,
     ]
+  );
+}
+
+async function sendUnresolvedFoodbusinessLog({
+  icName,
+  action,
+  originalText,
+}) {
+  const actionText =
+    action === "clock_in"
+      ? "Einstempeln"
+      : "Ausstempeln";
+
+  const embed = createBaseEmbed(0xfee75c)
+    .setTitle("⚠️ • FOODBUSINESS NICHT ZUGEORDNET")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `👤 **IC-Name**\n└ ${icName || "Nicht erkannt"}\n\n` +
+        `🛠️ **Aktion**\n└ ${actionText}\n\n` +
+        "❌ **Problem**\n" +
+        "└ Kein eindeutiger berechtigter Discord-User gefunden.\n\n" +
+        "📄 **Originalmeldung**\n" +
+        `└ ${String(originalText || "").slice(0, 1000)}\n` +
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    );
+
+  await sendEmbed(CHANNELS.dutyLogs, embed);
+}
+
+async function ensureFoodbusinessEmployeeEligibility({
+  message,
+  member,
+  icName,
+  action,
+  durationMinutes,
+  originalText,
+}) {
+  if (isCountedEmployeeMember(member)) {
+    await ensureEmployee(member.id);
+
+    employeeRosterCache.userIds.add(member.id);
+    employeeRosterCache.lastRefreshAt = Date.now();
+    employeeRosterCache.lastSource =
+      "Foodbusiness-Zuordnung mit berechtigter Zeitrolle";
+
+    return true;
+  }
+
+  await saveFoodbusinessProcessed({
+    messageId: message.id,
+    userId: member.id,
+    icName,
+    action,
+    minutes: durationMinutes || 0,
+    status: "ignored_missing_counted_role",
+    originalText,
+  });
+
+  const embed = createBaseEmbed(0xfee75c)
+    .setTitle("⚠️ • FOODBUSINESS NICHT GEBUCHT")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `👤 **IC-Name**\n└ ${icName}\n\n` +
+        `👥 **Discord-User**\n└ ${member}\n\n` +
+        "❌ **Grund**\n" +
+        "└ Die Person besitzt keine berechtigte Zeitrolle.\n\n" +
+        "📌 **Folge**\n" +
+        "└ Es wurde keine Arbeitszeit gespeichert.\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    );
+
+  await sendEmbed(CHANNELS.dutyLogs, embed);
+  return false;
+}
+
+async function handleFoodbusinessClockIn({
+  message,
+  member,
+  icName,
+  originalText,
+}) {
+  await ensureWeeklyReset();
+  await ensureEmployee(member.id);
+
+  await withTransaction(async (databaseClient) => {
+    await databaseClient.query(
+      `
+        INSERT INTO active_sessions (
+          user_id,
+          ic_name,
+          started_at,
+          source_message_id
+        )
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+          ic_name = EXCLUDED.ic_name,
+          started_at = EXCLUDED.started_at,
+          source_message_id = EXCLUDED.source_message_id;
+      `,
+      [member.id, icName, message.createdAt, message.id]
+    );
+
+    await databaseClient.query(
+      `
+        INSERT INTO foodbusiness_processed_logs (
+          message_id,
+          user_id,
+          ic_name,
+          action,
+          minutes,
+          processing_status,
+          original_text
+        )
+        VALUES ($1, $2, $3, 'clock_in', 0, 'assigned', $4)
+        ON CONFLICT (message_id)
+        DO NOTHING;
+      `,
+      [message.id, member.id, icName, originalText]
+    );
+  });
+
+  await saveFoodbusinessNameMapping(
+    icName,
+    member.id
   ).catch(() => null);
+
+  await safeAddRoles(
+    member,
+    ROLES.onDuty,
+    "Automatisch über Foodbusiness eingestempelt"
+  );
 
   await query(
     `DELETE FROM stale_duty_alerts WHERE user_id = $1`,
     [member.id]
-  );
+  ).catch(() => null);
 
   const embed = createBaseEmbed(0x57f287)
     .setTitle("🟢 • FOODBUSINESS EINGESTEMPELT")
@@ -4193,9 +4263,7 @@ async function handleFoodbusinessClockIn({
         `👤 **IC-Name**\n└ ${icName}\n\n` +
         `👥 **Discord-User**\n└ ${member}\n\n` +
         "✅ **Aktion**\n" +
-        "└ Im-Dienst-Rolle wurde vergeben.\n\n" +
-        "🛠️ **Zuordnung**\n" +
-        "└ Automatisch\n" +
+        "└ Im-Dienst-Rolle wurde vergeben.\n" +
         "━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     .setFooter({
@@ -4213,11 +4281,6 @@ async function handleFoodbusinessClockOut({
   durationMinutes,
   originalText,
 }) {
-  const minutes = Math.max(
-    1,
-    Math.round(Number(durationMinutes) || 1)
-  );
-
   await ensureWeeklyReset();
   await ensureEmployee(member.id);
 
@@ -4230,8 +4293,48 @@ async function handleFoodbusinessClockOut({
     [member.id]
   );
 
+  const activeStartedAt =
+    sessionResult.rows[0]?.started_at
+      ? new Date(sessionResult.rows[0].started_at)
+      : null;
+
+  let minutes = Number(durationMinutes);
+
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    if (activeStartedAt) {
+      minutes = Math.max(
+        1,
+        Math.ceil(
+          (message.createdAt.getTime() -
+            activeStartedAt.getTime()) /
+            60000
+        )
+      );
+    } else {
+      await saveFoodbusinessProcessed({
+        messageId: message.id,
+        userId: member.id,
+        icName,
+        action: "clock_out",
+        minutes: 0,
+        status: "unresolved_missing_duration",
+        originalText,
+      });
+
+      await sendUnresolvedFoodbusinessLog({
+        icName,
+        action: "clock_out",
+        originalText,
+      });
+
+      return;
+    }
+  }
+
+  minutes = Math.max(1, Math.round(minutes));
+
   const startedAt =
-    sessionResult.rows[0]?.started_at ||
+    activeStartedAt ||
     new Date(
       message.createdAt.getTime() -
         minutes * 60 * 1000
@@ -4274,53 +4377,10 @@ async function handleFoodbusinessClockOut({
         );
 
       if (processedInsert.rowCount === 0) {
-        const currentTotals =
-          await databaseClient.query(
-            `
-              SELECT
-                weekly_minutes,
-                total_minutes
-              FROM employees
-              WHERE user_id = $1
-            `,
-            [member.id]
-          );
-
         return {
           alreadyProcessed: true,
-          weeklyMinutes:
-            Number(
-              currentTotals.rows[0]?.weekly_minutes
-            ) || 0,
-          totalMinutes:
-            Number(
-              currentTotals.rows[0]?.total_minutes
-            ) || 0,
         };
       }
-
-      const beforeResult =
-        await databaseClient.query(
-          `
-            SELECT
-              weekly_minutes,
-              total_minutes
-            FROM employees
-            WHERE user_id = $1
-            FOR UPDATE
-          `,
-          [member.id]
-        );
-
-      const beforeWeekly =
-        Number(
-          beforeResult.rows[0]?.weekly_minutes
-        ) || 0;
-
-      const beforeTotal =
-        Number(
-          beforeResult.rows[0]?.total_minutes
-        ) || 0;
 
       await databaseClient.query(
         `
@@ -4331,6 +4391,7 @@ async function handleFoodbusinessClockOut({
             ended_at,
             minutes,
             corrected,
+            correction_reason,
             source_message_id
           )
           VALUES (
@@ -4340,6 +4401,7 @@ async function handleFoodbusinessClockOut({
             $4,
             $5,
             FALSE,
+            NULL,
             $6
           )
           ON CONFLICT (source_message_id)
@@ -4355,24 +4417,23 @@ async function handleFoodbusinessClockOut({
         ]
       );
 
-      const totals =
-        await databaseClient.query(
-          `
-            UPDATE employees
-            SET
-              weekly_minutes =
-                COALESCE(weekly_minutes, 0) + $2,
-              total_minutes =
-                COALESCE(total_minutes, 0) + $2,
-              left_server = FALSE,
-              updated_at = NOW()
-            WHERE user_id = $1
-            RETURNING
-              weekly_minutes,
-              total_minutes;
-          `,
-          [member.id, minutes]
-        );
+      const totals = await databaseClient.query(
+        `
+          UPDATE employees
+          SET
+            weekly_minutes =
+              COALESCE(weekly_minutes, 0) + $2,
+            total_minutes =
+              COALESCE(total_minutes, 0) + $2,
+            left_server = FALSE,
+            updated_at = NOW()
+          WHERE user_id = $1
+          RETURNING
+            weekly_minutes,
+            total_minutes;
+        `,
+        [member.id, minutes]
+      );
 
       if (totals.rowCount !== 1) {
         throw new Error(
@@ -4380,69 +4441,29 @@ async function handleFoodbusinessClockOut({
         );
       }
 
-      const weeklyMinutes =
-        Number(
-          totals.rows[0].weekly_minutes
-        ) || 0;
-
-      const totalMinutes =
-        Number(
-          totals.rows[0].total_minutes
-        ) || 0;
-
-      if (
-        weeklyMinutes !== beforeWeekly + minutes ||
-        totalMinutes !== beforeTotal + minutes
-      ) {
-        throw new Error(
-          `Zeitprüfung fehlgeschlagen: vorher ${beforeWeekly}/${beforeTotal}, ` +
-          `nachher ${weeklyMinutes}/${totalMinutes}, Buchung ${minutes}.`
-        );
-      }
-
       await databaseClient.query(
-        `
-          DELETE FROM active_sessions
-          WHERE user_id = $1
-        `,
+        `DELETE FROM active_sessions WHERE user_id = $1`,
         [member.id]
-      );
-
-      await databaseClient.query(
-        `
-          INSERT INTO foodbusiness_name_mappings (
-            normalized_name,
-            original_name,
-            user_id,
-            created_by,
-            updated_at
-          )
-          VALUES ($1, $2, $3, 'System', NOW())
-          ON CONFLICT (normalized_name)
-          DO UPDATE SET
-            original_name = EXCLUDED.original_name,
-            user_id = EXCLUDED.user_id,
-            updated_at = NOW();
-        `,
-        [
-          normalizeFoodBusinessName(icName),
-          icName,
-          member.id,
-        ]
       );
 
       return {
         alreadyProcessed: false,
-        weeklyMinutes,
-        totalMinutes,
+        weeklyMinutes:
+          Number(totals.rows[0].weekly_minutes) || 0,
+        totalMinutes:
+          Number(totals.rows[0].total_minutes) || 0,
       };
     }
   );
 
   if (bookingResult.alreadyProcessed) {
-    await refreshAllTimeDisplays();
     return;
   }
+
+  await saveFoodbusinessNameMapping(
+    icName,
+    member.id
+  ).catch(() => null);
 
   await safeRemoveRoles(
     member,
@@ -4453,36 +4474,7 @@ async function handleFoodbusinessClockOut({
   await query(
     `DELETE FROM stale_duty_alerts WHERE user_id = $1`,
     [member.id]
-  );
-
-  employeeRosterCache.userIds.add(member.id);
-  employeeRosterCache.lastRefreshAt = Date.now();
-  employeeRosterCache.lastSource =
-    "Foodbusiness-Zeitbuchung";
-
-  // Direkt nach der Buchung nochmals aus Sessions abgleichen.
-  await repairEmployeeTimesFromSessions(member.id);
-
-  const verifiedResult = await query(
-    `
-      SELECT
-        weekly_minutes,
-        total_minutes
-      FROM employees
-      WHERE user_id = $1
-    `,
-    [member.id]
-  );
-
-  const verifiedWeekly =
-    Number(
-      verifiedResult.rows[0]?.weekly_minutes
-    ) || bookingResult.weeklyMinutes;
-
-  const verifiedTotal =
-    Number(
-      verifiedResult.rows[0]?.total_minutes
-    ) || bookingResult.totalMinutes;
+  ).catch(() => null);
 
   const embed = createBaseEmbed(0xed4245)
     .setTitle("🔴 • FOODBUSINESS AUSGESTEMPELT")
@@ -4492,15 +4484,13 @@ async function handleFoodbusinessClockOut({
         `👥 **Discord-User**\n└ ${member}\n\n` +
         `⏱️ **Arbeitszeit**\n└ ${formatShortMinutes(minutes)}\n\n` +
         `📊 **Neue Wochenzeit**\n└ ${formatShortMinutes(
-          verifiedWeekly
+          bookingResult.weeklyMinutes
         )}\n\n` +
         `🏆 **Neue Gesamtzeit**\n└ ${formatShortMinutes(
-          verifiedTotal
+          bookingResult.totalMinutes
         )}\n\n` +
         "🔴 **Aktion**\n" +
-        "└ Im-Dienst-Rolle wurde entfernt.\n\n" +
-        "🛠️ **Zuordnung**\n" +
-        "└ Automatisch\n" +
+        "└ Im-Dienst-Rolle wurde entfernt.\n" +
         "━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     .setFooter({
@@ -4508,17 +4498,19 @@ async function handleFoodbusinessClockOut({
     });
 
   await sendEmbed(CHANNELS.dutyLogs, embed);
-  await refreshAllTimeDisplays();
+  await updateTimeOverviewMessages().catch(() => null);
 
   console.log(
     `✅ Arbeitszeit gebucht: ${member.id} +${minutes} Min. ` +
-    `(Weekly ${verifiedWeekly}, Gesamt ${verifiedTotal}).`
+      `(Weekly ${bookingResult.weeklyMinutes}, ` +
+      `Gesamt ${bookingResult.totalMinutes}).`
   );
 }
 
 async function processFoodbusinessTimeMessage(message) {
   if (
-    message.channelId !== CHANNELS.foodbusinessTimeSource ||
+    message.channelId !==
+      CHANNELS.foodbusinessTimeSource ||
     !message.author.bot
   ) {
     return;
@@ -4529,13 +4521,19 @@ async function processFoodbusinessTimeMessage(message) {
   }
 
   const originalText = collectMessageText(message);
-  const action = extractFoodbusinessAction(originalText);
+  const action =
+    extractFoodbusinessAction(originalText);
 
-  if (!action) return;
+  if (!action) {
+    return;
+  }
 
-  const icName = extractFoodbusinessName(originalText);
+  const icName =
+    extractFoodbusinessName(originalText);
   const durationMinutes =
-    extractFoodbusinessDurationMinutes(originalText);
+    extractFoodbusinessDurationMinutes(
+      originalText
+    );
   const guild = message.guild;
 
   if (!guild || !icName) {
@@ -4558,7 +4556,10 @@ async function processFoodbusinessTimeMessage(message) {
     return;
   }
 
-  const member = await findMemberByIcName(guild, icName);
+  const member = await findMemberByIcName(
+    guild,
+    icName
+  );
 
   if (!member) {
     await saveFoodbusinessProcessed({
@@ -4601,6 +4602,7 @@ async function processFoodbusinessTimeMessage(message) {
       icName,
       originalText,
     });
+
     return;
   }
 
@@ -4613,15 +4615,43 @@ async function processFoodbusinessTimeMessage(message) {
   });
 }
 
+async function endDutyWithoutBooking(
+  member,
+  reason
+) {
+  if (!member) return false;
+
+  await query(
+    `DELETE FROM active_sessions WHERE user_id = $1`,
+    [member.id]
+  ).catch(() => null);
+
+  await query(
+    `DELETE FROM stale_duty_alerts WHERE user_id = $1`,
+    [member.id]
+  ).catch(() => null);
+
+  await safeRemoveRoles(
+    member,
+    ROLES.onDuty,
+    reason
+  );
+
+  await updateTimeOverviewMessages().catch(() => null);
+  return true;
+}
+
 async function processFoodbusinessMoneyMessage(message) {
   if (
-    message.channelId !== CHANNELS.foodbusinessMoneySource ||
+    message.channelId !==
+      CHANNELS.foodbusinessMoneySource ||
     !message.author.bot
   ) {
     return;
   }
 
   const originalText = collectMessageText(message);
+
   const existing = await query(
     `
       SELECT 1
@@ -4631,7 +4661,9 @@ async function processFoodbusinessMoneyMessage(message) {
     [message.id]
   );
 
-  if (existing.rowCount > 0) return;
+  if (existing.rowCount > 0) {
+    return;
+  }
 
   const amountMatches = [
     ...originalText.matchAll(
@@ -4657,8 +4689,80 @@ async function processFoodbusinessMoneyMessage(message) {
       )
       VALUES ($1, $2, $3, $4);
     `,
-    [message.id, amount, originalText, message.createdAt]
+    [
+      message.id,
+      amount,
+      originalText,
+      message.createdAt,
+    ]
   );
+
+  if (!/\bNPC\b/i.test(originalText)) {
+    return;
+  }
+
+  const guild = message.guild;
+  if (!guild) return;
+
+  let targetMember = null;
+  const actorName =
+    extractNpcActorName(originalText);
+
+  if (actorName) {
+    targetMember = await findMemberByIcName(
+      guild,
+      actorName
+    );
+  }
+
+  if (!targetMember) {
+    const activeResult = await query(
+      `
+        SELECT user_id
+        FROM active_sessions
+        ORDER BY started_at ASC
+      `
+    );
+
+    if (activeResult.rows.length === 1) {
+      targetMember = await guild.members
+        .fetch(activeResult.rows[0].user_id)
+        .catch(() => null);
+    }
+  }
+
+  if (!targetMember) {
+    await sendGeneralLog(
+      "⚠️ • NPC-DIENSTENDE NICHT ZUGEORDNET",
+      "In einem Foodbusiness-Geldlog wurde **NPC** erkannt, " +
+        "aber es konnte kein eindeutiger aktiver Mitarbeiter bestimmt werden.\n\n" +
+        `**Nachricht:** ${message.id}\n` +
+        `**Original:** ${originalText.slice(0, 1000)}`,
+      0xfee75c
+    );
+
+    return;
+  }
+
+  await endDutyWithoutBooking(
+    targetMember,
+    "Automatisches Dienstende durch NPC-Kauf"
+  );
+
+  const embed = createBaseEmbed(0xed4245)
+    .setTitle("🔴 • DIENST DURCH NPC-KAUF BEENDET")
+    .setDescription(
+      "━━━━━━━━━━━━━━━━━━━━━━━━\n" +
+        `👥 **Discord-User**\n└ ${targetMember}\n\n` +
+        "💰 **Erkennung**\n" +
+        "└ NPC im Foodbusiness-Geldlog erkannt.\n\n" +
+        "🔴 **Aktion**\n" +
+        "└ Im-Dienst-Rolle wurde entfernt.\n" +
+        "└ Offene Session wurde beendet, ohne zusätzliche Zeit zu buchen.\n" +
+        "━━━━━━━━━━━━━━━━━━━━━━━━"
+    );
+
+  await sendEmbed(CHANNELS.dutyLogs, embed);
 }
 
 // ============================================================
@@ -5148,7 +5252,8 @@ async function buildStatusEmbed() {
       Mitarbeiterpanel: CHANNELS.employeePanel,
       Managementpanel: CHANNELS.managementPanel,
       Dashboard: CHANNELS.dashboard,
-      "Foodbusiness-Quelle": CHANNELS.foodbusinessTimeSource,
+      "Foodbusiness-Zeitquelle": CHANNELS.foodbusinessTimeSource,
+      "Foodbusiness-Geldquelle": CHANNELS.foodbusinessMoneySource,
       Dienstlogs: CHANNELS.dutyLogs,
     }).map(async ([name, channelId]) => {
       const channel = await fetchTextChannel(channelId);
@@ -6715,21 +6820,9 @@ client.on(Events.GuildMemberAdd, async (member) => {
 client.on(Events.GuildMemberRemove, async (member) => {
   if (member.guild.id !== GUILD_ID) return;
 
-  employeeRosterCache.userIds.delete(member.id);
-  employeeRosterCache.lastRefreshAt = Date.now();
-
-  await query(
-    `
-      UPDATE employees
-      SET left_server = TRUE, updated_at = NOW()
-      WHERE user_id = $1
-    `,
-    [member.id]
-  ).catch(() => null);
-
-  await query(
-    `DELETE FROM active_sessions WHERE user_id = $1`,
-    [member.id]
+  await purgeEmployeeTimeData(
+    member.id,
+    "Discord verlassen"
   ).catch(() => null);
 
   const embed = createBaseEmbed(0xed4245)
@@ -6740,7 +6833,7 @@ client.on(Events.GuildMemberRemove, async (member) => {
     .setThumbnail(member.user.displayAvatarURL());
 
   await sendEmbed(CHANNELS.leave, embed);
-  await updateDashboardMessage().catch(() => null);
+  await updateTimeOverviewMessages().catch(() => null);
 });
 
 client.on(
@@ -6753,16 +6846,16 @@ client.on(
       const hadEmployeeRole = isEmployee(oldMember);
       const hasEmployeeRole = isEmployee(newMember);
 
-      const hadManagerRole = hasManagerPosition(oldMember);
-      const hasManagerRole = hasManagerPosition(newMember);
+      const hadManagerRole =
+        hasManagerPosition(oldMember);
+      const hasManagerRole =
+        hasManagerPosition(newMember);
 
       const employeeWasAdded =
         !oldMember.roles.cache.has(ROLES.employee) &&
         newMember.roles.cache.has(ROLES.employee);
 
-      // Wer direkt Probe-Manager, Manager oder Personal Manager wird,
-      // erhält automatisch normale Mitarbeiterrolle, Zusatzrolle
-      // und Verwaltungsrolle. Probe-Mitarbeiter wird entfernt.
+      // Bestehende automatische Zusatzrollen bleiben erhalten.
       if (hasManagerRole) {
         await safeAddRoles(
           newMember,
@@ -6780,16 +6873,12 @@ client.on(
           "Management erhält die normale Mitarbeiterrolle"
         );
       } else if (hasEmployeeRole) {
-        // Probe-Mitarbeiter und Mitarbeiter erhalten immer
-        // die Mitarbeiterzusatzrolle.
         await safeAddRoles(
           newMember,
           ROLES.employeeAddon,
           "Automatische Mitarbeiterzusatzrolle"
         );
 
-        // Beim Aufstieg von Probe-Mitarbeiter zu Mitarbeiter
-        // wird Probe-Mitarbeiter automatisch entfernt.
         if (employeeWasAdded) {
           await safeRemoveRoles(
             newMember,
@@ -6799,8 +6888,6 @@ client.on(
         }
       }
 
-      // Wenn die letzte Managementposition entfernt wurde,
-      // wird auch die Verwaltungsrolle entfernt.
       if (hadManagerRole && !hasManagerRole) {
         await safeRemoveRoles(
           newMember,
@@ -6809,8 +6896,6 @@ client.on(
         );
       }
 
-      // Wenn weder Mitarbeiter- noch Managementposition vorhanden ist,
-      // wird auch die Mitarbeiterzusatzrolle entfernt.
       if (!hasEmployeeRole && !hasManagerRole) {
         await safeRemoveRoles(
           newMember,
@@ -6819,46 +6904,36 @@ client.on(
         );
       }
 
-      // Für Dashboard und Leaderboards zählen wirklich nur
-      // Mitarbeiter- oder Probe-Mitarbeiterrolle. Management
-      // wird durch die automatische Rollenverknüpfung ebenfalls
-      // mit der normalen Mitarbeiterrolle ausgestattet.
-      const currentlyEmployee = isEmployee(newMember);
+      // Entscheidend für die Zeitliste sind ausschließlich die 7
+      // COUNTED_EMPLOYEE_ROLE_IDS.
+      const hasCountedRole =
+        isCountedEmployeeMember(newMember);
 
-      if (currentlyEmployee) {
+      if (hasCountedRole) {
         await ensureEmployee(newMember.id);
-        employeeRosterCache.userIds.add(newMember.id);
+        employeeRosterCache.userIds.add(
+          newMember.id
+        );
       } else {
-        await query(
-          `
-            UPDATE employees
-            SET left_server = TRUE, updated_at = NOW()
-            WHERE user_id = $1
-          `,
-          [newMember.id]
+        await purgeEmployeeTimeData(
+          newMember.id,
+          "Alle berechtigten Zeitrollen wurden entfernt"
         );
 
-        employeeRosterCache.userIds.delete(newMember.id);
-
-        if (hadEmployeeRole) {
-          await query(
-            `DELETE FROM active_sessions WHERE user_id = $1`,
-            [newMember.id]
-          );
-
-          await safeRemoveRoles(
-            newMember,
-            ROLES.onDuty,
-            "Keine Mitarbeiter- oder Probe-Mitarbeiterrolle mehr vorhanden"
-          );
-        }
+        await safeRemoveRoles(
+          newMember,
+          ROLES.onDuty,
+          "Keine berechtigte Zeitrolle mehr vorhanden"
+        );
       }
 
-      employeeRosterCache.lastRefreshAt = Date.now();
+      employeeRosterCache.lastRefreshAt =
+        Date.now();
       employeeRosterCache.lastSource =
         "Discord-Rollenänderung";
 
-      await updateTimeOverviewMessages().catch(() => null);
+      await updateTimeOverviewMessages()
+        .catch(() => null);
     } catch (error) {
       console.error(
         `❌ Automatische Rollensynchronisierung für ${newMember.id} fehlgeschlagen:`,
@@ -6922,7 +6997,6 @@ client.once(Events.ClientReady, async (readyClient) => {
     updateBotStatus();
     setInterval(updateBotStatus, SETTINGS.statusIntervalMs);
 
-    await applyOneTimeWeeklyCleanup();
     await ensureWeeklyReset();
 
     await refreshAllTimeDisplays().catch((error) => {
